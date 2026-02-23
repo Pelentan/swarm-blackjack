@@ -1,0 +1,21 @@
+cabal-version: 2.4
+name:          hand-evaluator
+version:       0.1.0
+synopsis:      Blackjack hand evaluation — pure function HTTP service
+description:
+  Evaluates blackjack hands. Cards in, value out.
+  Pure Haskell — no side effects in the evaluation logic.
+  HTTP layer is the only impure code.
+
+executable hand-evaluator
+  main-is:          Main.hs
+  build-depends:
+      base       >= 4.14
+    , aeson      >= 2.0
+    , wai        >= 3.2
+    , warp       >= 3.3
+    , http-types >= 0.12
+    , bytestring >= 0.11
+    , text       >= 1.2
+  default-language: Haskell2010
+  ghc-options:      -O2 -Wall

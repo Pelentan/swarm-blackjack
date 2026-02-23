@@ -1,0 +1,187 @@
+openapi: 3.1.0
+info:
+  title: Swarm Blackjack - Deck Service
+  description: |
+    Owns the shoe. Manages shuffle, cut, and deal operations.
+    Stateful per-table — each table has its own shoe instance.
+    Written in Go for speed: throughput matters when dealing at scale.
+    
+    Internal service — mTLS only, no external exposure.
+  version: 0.1.0
+
+servers:
+  - url: http://deck-service:3002
+    description: Internal Docker network
+
+paths:
+  /health:
+    get:
+      summary: Service health
+      responses:
+        '200':
+          description: Healthy
+
+  /shoe:
+    post:
+      summary: Initialize a new shoe for a table
+      description: Creates a fresh shuffled shoe (1-8 decks) for the given table.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShoeRequest'
+      responses:
+        '201':
+          description: Shoe created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShoeStatus'
+        '409':
+          description: Shoe already exists for this table
+
+  /shoe/{tableId}:
+    get:
+      summary: Get shoe status
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      responses:
+        '200':
+          description: Shoe status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShoeStatus'
+
+    delete:
+      summary: Discard shoe (end of shoe or table closed)
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      responses:
+        '204':
+          description: Shoe discarded
+
+  /shoe/{tableId}/deal:
+    post:
+      summary: Deal cards from the shoe
+      description: |
+        Deals the requested number of cards from the table's shoe.
+        Automatically shuffles a new shoe when penetration threshold is reached.
+        Penetration is configurable — default 75% dealt before reshuffle.
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DealRequest'
+      responses:
+        '200':
+          description: Cards dealt
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DealResponse'
+        '404':
+          description: No shoe for this table — initialize first
+        '503':
+          description: Reshuffling in progress
+
+  /shoe/{tableId}/shuffle:
+    post:
+      summary: Force reshuffle
+      description: Discards remaining cards and shuffles a fresh shoe.
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      responses:
+        '200':
+          description: Shoe reshuffled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShoeStatus'
+
+components:
+  parameters:
+    TableId:
+      name: tableId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    Card:
+      type: object
+      required: [suit, rank]
+      properties:
+        suit:
+          type: string
+          enum: [hearts, diamonds, clubs, spades]
+        rank:
+          type: string
+          enum: [A, '2', '3', '4', '5', '6', '7', '8', '9', '10', J, Q, K]
+
+    ShoeRequest:
+      type: object
+      required: [tableId]
+      properties:
+        tableId:
+          type: string
+          format: uuid
+        deckCount:
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 6
+          description: Number of standard decks in the shoe
+        penetration:
+          type: number
+          minimum: 0.5
+          maximum: 0.9
+          default: 0.75
+          description: Fraction of shoe dealt before reshuffle
+
+    ShoeStatus:
+      type: object
+      properties:
+        tableId:
+          type: string
+          format: uuid
+        totalCards:
+          type: integer
+        remainingCards:
+          type: integer
+        dealtCards:
+          type: integer
+        penetrationReached:
+          type: boolean
+        deckCount:
+          type: integer
+
+    DealRequest:
+      type: object
+      required: [count]
+      properties:
+        count:
+          type: integer
+          minimum: 1
+          maximum: 10
+          description: Number of cards to deal
+
+    DealResponse:
+      type: object
+      required: [cards, shoeStatus]
+      properties:
+        cards:
+          type: array
+          items:
+            $ref: '#/components/schemas/Card'
+        shoeStatus:
+          $ref: '#/components/schemas/ShoeStatus'
+        reshuffled:
+          type: boolean
+          description: True if a reshuffle occurred before this deal

@@ -1,0 +1,233 @@
+version: '3.9'
+
+# ── Swarm Blackjack — Docker Compose ─────────────────────────────────────────
+#
+# Architecture:
+#   - All services on isolated bridge network (swarm-net)
+#   - Only gateway and ui exposed externally
+#   - mTLS between services: cert generation via infra/scripts/gen-certs.sh
+#     (see README — run before first `docker compose up`)
+#   - Bank DB completely isolated: separate PostgreSQL instance,
+#     only bank-service has credentials
+#
+# Start:  docker compose up --build
+# Stop:   docker compose down
+# Logs:   docker compose logs -f [service-name]
+
+networks:
+  swarm-net:
+    driver: bridge
+    # Isolated internal network — nothing reaches services directly
+    # except through gateway
+
+volumes:
+  game-db-data:
+  bank-db-data:
+  redis-data:
+
+services:
+
+  # ── Gateway ────────────────────────────────────────────────────────────────
+  gateway:
+    build: ./gateway
+    container_name: swarm-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      PORT: "8080"
+      GAME_STATE_URL: "http://game-state:3001"
+      AUTH_URL: "http://auth-service:3006"
+      BANK_URL: "http://bank-service:3005"
+      CHAT_URL: "http://chat-service:3007"
+    networks:
+      - swarm-net
+    depends_on:
+      - game-state
+      - auth-service
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Game Domain ────────────────────────────────────────────────────────────
+  game-state:
+    build: ./game-state
+    container_name: swarm-game-state
+    environment:
+      PORT: "3001"
+      DECK_SERVICE_URL: "http://deck-service:3002"
+      HAND_EVALUATOR_URL: "http://hand-evaluator:3003"
+      DEALER_AI_URL: "http://dealer-ai:3004"
+    networks:
+      - swarm-net
+    depends_on:
+      - deck-service
+      - hand-evaluator
+      - dealer-ai
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  deck-service:
+    build: ./deck-service
+    container_name: swarm-deck-service
+    environment:
+      PORT: "3002"
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3002/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  hand-evaluator:
+    build: ./hand-evaluator
+    container_name: swarm-hand-evaluator
+    environment:
+      PORT: "3003"
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3003/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  dealer-ai:
+    build: ./dealer-ai
+    container_name: swarm-dealer-ai
+    environment:
+      PORT: "3004"
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3004/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ── Security & Financial Domain ────────────────────────────────────────────
+  auth-service:
+    build: ./auth-service
+    container_name: swarm-auth
+    environment:
+      PORT: "3006"
+      REDIS_URL: "redis://redis:6379"
+    networks:
+      - swarm-net
+    depends_on:
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  bank-service:
+    build: ./bank-service
+    container_name: swarm-bank
+    environment:
+      PORT: "3005"
+      # Bank DB credentials — ONLY bank-service has these
+      DB_URL: "postgresql://bankuser:bankpass@bank-db:5432/bankdb"
+      REDIS_URL: "redis://redis:6379"
+    networks:
+      - swarm-net
+    depends_on:
+      - bank-db
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3005/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Communication Domain ────────────────────────────────────────────────────
+  chat-service:
+    build: ./chat-service
+    container_name: swarm-chat
+    environment:
+      PORT: "3007"
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3007/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  email-service:
+    build: ./email-service
+    container_name: swarm-email
+    environment:
+      PORT: "3008"
+    networks:
+      - swarm-net
+    restart: unless-stopped
+
+  # ── UI ─────────────────────────────────────────────────────────────────────
+  ui:
+    build:
+      context: ./ui
+      args:
+        REACT_APP_GATEWAY_URL: "http://localhost:8080"
+    container_name: swarm-ui
+    ports:
+      - "3000:3000"
+    networks:
+      - swarm-net
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+  # ── Data Tier ──────────────────────────────────────────────────────────────
+  game-db:
+    image: postgres:16-alpine
+    container_name: swarm-game-db
+    environment:
+      POSTGRES_DB: gamedb
+      POSTGRES_USER: gameuser
+      POSTGRES_PASSWORD: gamepass
+    volumes:
+      - game-db-data:/var/lib/postgresql/data
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    # Not exposed externally — only reachable from swarm-net
+
+  bank-db:
+    image: postgres:16-alpine
+    container_name: swarm-bank-db
+    environment:
+      POSTGRES_DB: bankdb
+      POSTGRES_USER: bankuser
+      POSTGRES_PASSWORD: bankpass
+    volumes:
+      - bank-db-data:/var/lib/postgresql/data
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    # Completely isolated — bank-service is the ONLY service with these credentials
+
+  redis:
+    image: redis:7-alpine
+    container_name: swarm-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    # Session store — refresh tokens, rate limiting state, instant revocation

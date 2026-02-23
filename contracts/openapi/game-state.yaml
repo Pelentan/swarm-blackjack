@@ -1,0 +1,356 @@
+openapi: 3.1.0
+info:
+  title: Swarm Blackjack - Game State Service
+  description: |
+    Orchestrates game flow. State machine for the round lifecycle.
+    Coordinates deck-service, hand-evaluator, and dealer-ai.
+    Pushes state updates via SSE. Receives player actions via REST.
+    
+    Internal service — not directly accessible from outside the Docker network.
+    All external access proxied through the API Gateway.
+  version: 0.1.0
+
+servers:
+  - url: http://game-state:3001
+    description: Internal Docker network
+
+tags:
+  - name: state
+    description: Game state management
+  - name: actions
+    description: Player action processing
+  - name: tables
+    description: Table management
+
+paths:
+  /health:
+    get:
+      summary: Service health
+      tags: [state]
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /tables:
+    get:
+      summary: List all active tables
+      tags: [tables]
+      responses:
+        '200':
+          description: Table list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TableSummary'
+
+    post:
+      summary: Create a new table
+      tags: [tables]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTableRequest'
+      responses:
+        '201':
+          description: Table created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableSummary'
+
+  /tables/{tableId}:
+    get:
+      summary: Get current table state (snapshot)
+      tags: [state]
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      responses:
+        '200':
+          description: Current game state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GameState'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /tables/{tableId}/stream:
+    get:
+      summary: SSE stream for real-time game state
+      description: |
+        Server-Sent Events stream. Client receives a full GameState snapshot
+        on connect, then delta events as game progresses.
+        
+        Event types:
+          - game_state: Full state snapshot
+          - phase_change: Game phase transition
+          - player_joined: New player at table
+          - player_left: Player departed
+          - error: Something went wrong
+      tags: [state]
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+        - name: playerId
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: SSE stream
+          content:
+            text/event-stream:
+              schema:
+                $ref: '#/components/schemas/GameStateEvent'
+
+  /tables/{tableId}/join:
+    post:
+      summary: Player joins table
+      tags: [tables]
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JoinRequest'
+      responses:
+        '200':
+          description: Joined successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GameState'
+        '409':
+          description: Table full
+
+  /tables/{tableId}/action:
+    post:
+      summary: Process player action
+      description: |
+        Validates action against current game phase and player state,
+        then coordinates with downstream services (deck, hand-evaluator, dealer-ai).
+        State update delivered via SSE stream, not in response body.
+      tags: [actions]
+      parameters:
+        - $ref: '#/components/parameters/TableId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlayerActionRequest'
+      responses:
+        '202':
+          description: Action accepted — update incoming via SSE
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ActionAccepted'
+        '400':
+          description: Invalid action for current phase
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Not this player's turn
+
+components:
+  parameters:
+    TableId:
+      name: tableId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  schemas:
+    Card:
+      type: object
+      required: [suit, rank]
+      properties:
+        suit:
+          type: string
+          enum: [hearts, diamonds, clubs, spades, hidden]
+        rank:
+          type: string
+          enum: [A, '2', '3', '4', '5', '6', '7', '8', '9', '10', J, Q, K, hidden]
+
+    PlayerState:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        chips:
+          type: integer
+        currentBet:
+          type: integer
+        hand:
+          type: array
+          items:
+            $ref: '#/components/schemas/Card'
+        handValue:
+          type: integer
+        isSoftHand:
+          type: boolean
+        status:
+          type: string
+          enum: [waiting, betting, playing, standing, bust, blackjack, won, lost, push]
+
+    DealerState:
+      type: object
+      properties:
+        hand:
+          type: array
+          items:
+            $ref: '#/components/schemas/Card'
+        handValue:
+          type: integer
+        isRevealed:
+          type: boolean
+
+    GameState:
+      type: object
+      required: [tableId, phase, players, dealer, timestamp]
+      properties:
+        tableId:
+          type: string
+          format: uuid
+        phase:
+          type: string
+          enum: [waiting, betting, dealing, player_turn, dealer_turn, payout, complete]
+        players:
+          type: array
+          items:
+            $ref: '#/components/schemas/PlayerState'
+        dealer:
+          $ref: '#/components/schemas/DealerState'
+        activePlayerId:
+          type: string
+          format: uuid
+          nullable: true
+        minBet:
+          type: integer
+        maxBet:
+          type: integer
+        handledBy:
+          type: string
+          description: Container hostname — visible in observability dashboard
+        timestamp:
+          type: string
+          format: date-time
+
+    GameStateEvent:
+      type: object
+      properties:
+        type:
+          type: string
+          enum: [game_state, phase_change, player_joined, player_left, error]
+        data:
+          $ref: '#/components/schemas/GameState'
+
+    TableSummary:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        playerCount:
+          type: integer
+        maxPlayers:
+          type: integer
+        phase:
+          type: string
+        minBet:
+          type: integer
+        maxBet:
+          type: integer
+
+    CreateTableRequest:
+      type: object
+      properties:
+        minBet:
+          type: integer
+          default: 10
+        maxBet:
+          type: integer
+          default: 500
+        maxPlayers:
+          type: integer
+          default: 6
+          maximum: 6
+
+    JoinRequest:
+      type: object
+      required: [playerId, playerName]
+      properties:
+        playerId:
+          type: string
+          format: uuid
+        playerName:
+          type: string
+
+    PlayerActionRequest:
+      type: object
+      required: [playerId, action]
+      properties:
+        playerId:
+          type: string
+          format: uuid
+        action:
+          type: string
+          enum: [bet, hit, stand, double, split, insurance]
+        amount:
+          type: integer
+          minimum: 1
+
+    ActionAccepted:
+      type: object
+      properties:
+        accepted:
+          type: boolean
+        message:
+          type: string
+
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+        service:
+          type: string
+        upstreams:
+          type: object
+          additionalProperties:
+            type: string
+
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+
+  responses:
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
