@@ -8,6 +8,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o observability-service 
 
 # Scratch container — static binary only, no shell, no attack surface
 FROM scratch
-COPY --from=builder /app/observability-service /observability-service
+COPY --from=builder /app/observability-service /
 EXPOSE 3009
 ENTRYPOINT ["/observability-service"]
