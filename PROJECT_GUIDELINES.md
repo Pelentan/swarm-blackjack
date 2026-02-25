@@ -1,0 +1,155 @@
+# Engineer-AI Partnership — Project Guidelines
+
+**Status:** Living Document  
+**Last Updated:** 2026-02-25  
+**Audience:** Michael + Claude (working reference)
+
+---
+
+## 1. Project Kickoff Checklist
+
+Before any code is written, the following must exist. Non-negotiable.
+
+### Stack Definition First
+Agree on the full tech stack before touching a file. Language choices, framework choices, database choices. These decisions drive everything that follows — .gitignore, security scanning, container base images, CI/CD pipeline.
+
+### Git Initialization (Commit Zero)
+Every project's first commit must include, at minimum:
+
+**`.gitignore`** — generated for the agreed stack. Polyglot projects get a combined file. Covers:
+- Compiled artifacts and binaries (language-specific)
+- Dependency directories (`node_modules/`, `vendor/`, `__pycache__/`, etc.)
+- IDE/editor cruft (`.idea/`, `.vscode/`, `*.swp`)
+- Environment files (`.env`, `.env.local`, `*.env`)
+- OS junk (`.DS_Store`, `Thumbs.db`)
+- Docker-specific (override files, local certs if generated)
+- Any secrets or key material paths defined in the project
+
+**`.github/workflows/security.yml`** — CodeQL scanning configured for the stack. If GitHub Actions isn't the CI, adapt accordingly, but security scanning is mandatory and goes in from day one.
+
+For polyglot projects, CodeQL config must enumerate all languages present. Don't let this be discovered on push.
+
+---
+
+## 2. Architecture-First Sequencing
+
+We design before we build. In this order:
+
+1. **Define service boundaries** — what is each service responsible for, and only responsible for
+2. **Write service contracts** (OpenAPI YAML or equivalent) — before implementation begins
+3. **Define stub behavior** — every stubbed service has a documented swap point (see Section 4)
+4. **Then implement**
+
+We learned this correctly in Swarm. Game state YAML, gateway YAML, and deck service YAML existed before a line of Go was written. The email and observability contracts were designed before those services were built. This is the pattern.
+
+---
+
+## 3. Three-Year Lifecycle as an Architectural Input
+
+Every service is designed to be completely rewritten within its first three years. This is not a failure state — it's the target.
+
+This principle shapes decisions at design time:
+
+- **Hard service boundaries** — no shared databases between services, no shared code libraries between services (shared contracts/interfaces are fine)
+- **REST over direct coupling** — services communicate via documented HTTP contracts, not shared state or in-process calls
+- **No "temporary" architectural decisions** — if it goes in, it's a design choice we can explain
+- **Containers as isolation units** — each service is independently deployable and independently replaceable
+
+The payoff: a service rewrite is a bounded, contained event. It doesn't require coordinating with five other teams or migrating a shared schema.
+
+---
+
+## 4. Stub Discipline
+
+Stubs are not placeholders — they are designed interfaces with deferred implementation.
+
+Every stub must have:
+- A fully defined request/response contract (same as a real service)
+- A clearly marked swap point (the single function or class where real implementation replaces stub behavior)
+- Console/log output that makes stubbing visible during demo ("would send email to X via SMTP")
+- Zero upstream impact when the stub is replaced — callers must not need to change
+
+**What we do not do:** stub the interface too. The contract is real even when the implementation isn't.
+
+---
+
+## 5. Security Posture
+
+### Sensitive Data in Git
+Environment files never go in. If a file could contain a secret, it's in `.gitignore` before the file is created. Generated certs, API keys, database credentials — all excluded.
+
+### Service Exposure
+Nothing is externally exposed that doesn't need to be. In Docker Compose, only the gateway gets a published port. All other services are on the internal network only. This maps directly to K8s network policies when we migrate.
+
+### Dependency Hygiene
+No dependency goes in without a reason. For Go: explicit `go.mod` with pinned versions. For Node: `package-lock.json` committed. For Python: `requirements.txt` with pinned versions. "Latest" is not a version.
+
+---
+
+## 6. README Standard
+
+Every project gets a README at commit zero. Minimum sections:
+
+- **What this is** — one paragraph, no jargon
+- **Architecture overview** — diagram or table of services/components
+- **Stack** — language and framework per component with a one-line rationale
+- **How to run** — must work from a clean clone with documented prerequisites
+- **AI-Augmented Development** — see template below
+
+### AI-Augmented Development Section Template
+```markdown
+## Development Methodology
+
+This project was built through AI-augmented development — a human-AI partnership 
+where architectural decisions, security design, and engineering judgment came from 
+human expertise, and implementation was accelerated by an AI collaborator fluent 
+across the full stack.
+
+The goal: demonstrate that experienced engineers working with AI can achieve 
+significant productivity gains while maintaining (and in some cases exceeding) 
+the quality standards of traditional development.
+```
+
+Adjust specifics per project, but the transparency is always there.
+
+---
+
+## 7. The "Measure Twice" Rule
+
+Before building anything non-trivial, we pause and ask:
+
+- What are the edge cases?
+- Are there decisions in this implementation that will be painful to reverse?
+- Is the requirement actually clear, or are we assuming?
+
+This feels slower. It isn't. Getting it right the first time beats two rounds of fixes.
+
+Trivial tasks (fixing a typo, renaming a variable) skip this. The judgment call on what's "trivial" is Michael's.
+
+---
+
+## 8. Delivery Standards (Code)
+
+When delivering code changes:
+
+- Every tarball includes `CHANGED_FILES.md` with date (UTC), feature description, and lists of modified and added files
+- File paths are relative from project root
+- No wrapper folders — extract directly into project directory
+- Only changed/new files — not the whole project
+
+**Beta quality bar:** zero manual steps after `docker compose build`. If it requires running a SQL command or editing a config file by hand, it's not done.
+
+---
+
+## 9. What We've Learned (Running Log)
+
+Lessons added as we discover them. Most recent first.
+
+**2026-02-25 — .gitignore + Security Actions are Commit Zero**  
+We discovered this reactively in the local AI machine conversation when the question "what should be in my .gitignore?" came up right before pushing to GitHub. That question should never happen mid-project. Both files are generated at project kickoff based on the agreed stack, before any code is written.
+
+**2026-02-25 — Service Contracts Before Implementation**  
+Validated in Swarm: writing the OpenAPI specs first forced clarity on what each service actually does. Ambiguities that would have caused mid-implementation pivots got resolved at the design stage instead.
+
+**2026-02-25 — Stub Contracts Are Real Contracts**  
+The email service being "stubbed" doesn't mean its interface is informal. The full request/response contract was designed and documented. When real SMTP goes in, no caller changes. That's the test of a good stub.
