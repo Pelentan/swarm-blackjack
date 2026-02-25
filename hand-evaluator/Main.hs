@@ -14,8 +14,8 @@ module Main where
 import Data.Aeson (FromJSON, ToJSON, decode, encode, object, (.=), (.:), withObject)
 import Data.Aeson.Types (Parser, parseJSON, toJSON, Value)
 import GHC.Generics (Generic)
-import Network.HTTP.Types (status200, status400, status405, hContentType)
-import Network.Wai (Application, Request, Response, requestMethod, requestBody, responseLBS, pathInfo)
+import Network.HTTP.Types (status200, status400, status405, hContentType, Status)
+import Network.Wai (Application, Request, Response, ResponseReceived, requestMethod, requestBody, responseLBS, pathInfo)
 import Network.Wai.Handler.Warp (run)
 import Data.ByteString.Lazy (ByteString)
 import qualified Data.ByteString.Lazy as BL
@@ -123,7 +123,7 @@ corsResponse = responseLBS status200
 notFoundResponse :: Response
 notFoundResponse = jsonResponse status400 $ object ["error" .= ("not found" :: T.Text)]
 
-jsonResponse :: Network.HTTP.Types.Status -> Value -> Response
+jsonResponse :: Status -> Value -> Response
 jsonResponse status body = responseLBS status
   [ (hContentType, "application/json")
   , ("Access-Control-Allow-Origin", "*")
@@ -135,9 +135,6 @@ main :: IO ()
 main = do
   portStr <- lookupEnv "PORT"
   let port = maybe 3003 read portStr :: Int
-  putStrLn $ "♠ Hand Evaluator (Haskell) starting on :" ++ show port
-  putStrLn   "  Pure function: Cards in → value out. No state. No side effects."
+  putStrLn $ "[hand-evaluator] starting on :" ++ show port
+  putStrLn   "[hand-evaluator] Pure function: Cards in -> value out. No state. No side effects."
   run port app
-
--- Required for WAI response type
-type ResponseReceived = ()

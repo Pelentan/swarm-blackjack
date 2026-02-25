@@ -1,5 +1,3 @@
-version: '3.9'
-
 # ── Swarm Blackjack — Docker Compose ─────────────────────────────────────────
 #
 # Architecture:
@@ -37,13 +35,18 @@ services:
       PORT: "8080"
       GAME_STATE_URL: "http://game-state:3001"
       AUTH_URL: "http://auth-service:3006"
+      AUTH_UI_URL: "http://auth-ui-service:3010"
       BANK_URL: "http://bank-service:3005"
       CHAT_URL: "http://chat-service:3007"
+      EMAIL_URL: "http://email-service:3008"
+      REDIS_URL: "redis:6379"
     networks:
       - swarm-net
     depends_on:
       - game-state
       - auth-service
+      - redis
+      - observability-service
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
@@ -60,12 +63,16 @@ services:
       DECK_SERVICE_URL: "http://deck-service:3002"
       HAND_EVALUATOR_URL: "http://hand-evaluator:3003"
       DEALER_AI_URL: "http://dealer-ai:3004"
+      OBSERVABILITY_URL: "http://observability-service:3009"
+      BANK_SERVICE_URL: "http://bank-service:3005"
     networks:
       - swarm-net
     depends_on:
       - deck-service
       - hand-evaluator
       - dealer-ai
+      - observability-service
+      - bank-service
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
@@ -122,13 +129,39 @@ services:
     environment:
       PORT: "3006"
       REDIS_URL: "redis://redis:6379"
+      JWT_SECRET: "swarm-blackjack-dev-secret-change-in-production"
+      EMAIL_URL: "http://email-service:3008"
+      BANK_URL: "http://bank-service:3005"
+      # Verification links go through gateway so UI topology stays internal
+      GATEWAY_URL: "http://localhost:8080"
+      UI_URL: "http://localhost:3000"
     networks:
       - swarm-net
     depends_on:
       - redis
+      - email-service
+      - bank-service
+      - postfix
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3006/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  auth-ui-service:
+    build: ./auth-ui-service
+    container_name: swarm-auth-ui
+    environment:
+      PORT: "3010"
+      AUTH_SERVICE_URL: "http://auth-service:3006"
+    networks:
+      - swarm-net
+    depends_on:
+      - auth-service
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3010/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -173,6 +206,33 @@ services:
     container_name: swarm-email
     environment:
       PORT: "3008"
+      SMTP_HOST: "postfix"
+      SMTP_PORT: "25"
+      SMTP_FROM: "${SMTP_FROM}"
+      SMTP_USE_TLS: "false"
+      AUTH_SERVICE_URL: "http://auth-service:3006"
+    networks:
+      - swarm-net
+    depends_on:
+      - postfix
+    restart: unless-stopped
+
+  # ── Mail ───────────────────────────────────────────────────────────────────
+  # Custom Postfix on Debian — send-only MTA, direct MX delivery.
+  # No relay, no credentials, no third-party images.
+  postfix:
+    build: ./postfix
+    container_name: swarm-postfix
+    environment:
+      MAIL_HOSTNAME: "swarm-blackjack.local"
+      MAIL_FROM_DOMAIN: "swarm-blackjack.local"
+      SMTP_RELAY_HOST: "${SMTP_RELAY_HOST}"
+      SMTP_RELAY_PORT: "${SMTP_RELAY_PORT}"
+      SMTP_USER: "${SMTP_USER}"
+      SMTP_PASSWORD: "${SMTP_PASSWORD}"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     networks:
       - swarm-net
     restart: unless-stopped
@@ -182,7 +242,7 @@ services:
     build:
       context: ./ui
       args:
-        REACT_APP_GATEWAY_URL: "http://localhost:8080"
+        VITE_GATEWAY_URL: ""
     container_name: swarm-ui
     ports:
       - "3000:3000"
@@ -231,3 +291,18 @@ services:
       - swarm-net
     restart: unless-stopped
     # Session store — refresh tokens, rate limiting state, instant revocation
+
+  # ── Observability ──────────────────────────────────────────────────────────
+  observability-service:
+    build: ./observability-service
+    container_name: swarm-observability
+    environment:
+      PORT: "3009"
+      REDIS_URL: "redis:6379"
+    networks:
+      - swarm-net
+    depends_on:
+      - redis
+    restart: unless-stopped
+    # Not exposed externally — internal only
+    # Scratch container: static binary, no shell, no attack surface

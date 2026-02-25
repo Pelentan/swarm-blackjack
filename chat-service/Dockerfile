@@ -1,15 +1,16 @@
-FROM elixir:1.16-alpine AS builder
+FROM elixir:1.16 AS builder
 WORKDIR /app
 RUN mix local.hex --force && mix local.rebar --force
-COPY mix.exs mix.lock* ./
-RUN mix deps.get --only prod
+COPY mix.exs ./
+RUN mix deps.get
+RUN mix deps.compile
+COPY config ./config
 COPY lib ./lib
 RUN MIX_ENV=prod mix compile
-RUN MIX_ENV=prod mix release
 
-FROM alpine:3.19
-RUN apk --no-cache add libstdc++ openssl ncurses-libs
+FROM elixir:1.16
 WORKDIR /app
-COPY --from=builder /app/_build/prod/rel/chat_service ./
+COPY --from=builder /app ./
 EXPOSE 3007
-CMD ["./bin/chat_service", "start"]
+ENV MIX_ENV=prod
+CMD ["mix", "run", "--no-halt"]

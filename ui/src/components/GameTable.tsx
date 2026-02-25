@@ -1,10 +1,10 @@
 import React from 'react';
-import { GameState, PlayerState, DealerState } from '../types';
+import { GameState, PlayerState, DealerState, PlayerAction } from '../types';
 import { CardComponent } from './Card';
 
 interface GameTableProps {
   gameState: GameState;
-  onAction: (action: string, amount?: number) => void;
+  onAction: (action: PlayerAction, amount?: number) => void;
   myPlayerId?: string;
 }
 
@@ -164,11 +164,11 @@ export const GameTable: React.FC<GameTableProps> = ({
       {/* Action buttons */}
       {isMyTurn && myPlayer?.status === 'playing' && (
         <div style={{ display: 'flex', gap: 8, justifyContent: 'center' }}>
-          {[
-            { label: 'Hit', action: 'hit', color: '#3182ce' },
-            { label: 'Stand', action: 'stand', color: '#718096' },
-            { label: 'Double', action: 'double', color: '#d69e2e' },
-          ].map(({ label, action, color }) => (
+          {([
+            { label: 'Hit', action: 'hit' as PlayerAction, color: '#3182ce' },
+            { label: 'Stand', action: 'stand' as PlayerAction, color: '#718096' },
+            { label: 'Double', action: 'double' as PlayerAction, color: '#d69e2e' },
+          ]).map(({ label, action, color }) => (
             <button
               key={action}
               onClick={() => onAction(action)}

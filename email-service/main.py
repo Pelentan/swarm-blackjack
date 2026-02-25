@@ -1,88 +1,113 @@
 """
-Email Service — Python STUB
-===========================
-Handles account verification magic links ONLY.
-(Magic links are not a login mechanism — they're a one-time email verification
-for new account creation. Login is passkeys/TOTP.)
+Email Service
+=============
+Language  : Python
+Framework : Flask + Gunicorn
 
-STUB: Logs to console instead of sending real email.
-Production swap: replace send_email() with SMTP/SendGrid/SES.
-Zero upstream contract changes required.
+Architecture: Four isolated layers behind a single /send endpoint.
+  transport.py   — SMTP stub (swap for production, zero upstream changes)
+  auth.py        — Auth/OPA stub (all policy decisions, never local)
+  encryption.py  — Public-key encryption stub
+  templates.py   — Message type registry and renderers
+  pipeline.py    — 9-step processing pipeline
+
+See contracts.md for full API specification.
 """
 
 import os
 import logging
-from datetime import datetime
 from flask import Flask, request, jsonify
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [email-service] %(message)s')
+import pipeline
+import templates
+import transport
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [email-service] %(levelname)s %(message)s'
+)
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
 
-def send_email(to: str, subject: str, body: str) -> bool:
-    """
-    STUB: Replace this function body with real SMTP/SendGrid/SES.
-    Signature stays identical — zero upstream changes.
-    """
-    log.info("=" * 60)
-    log.info(f"📧 STUB EMAIL (would be sent in production)")
-    log.info(f"   To:      {to}")
-    log.info(f"   Subject: {subject}")
-    log.info(f"   Body:    {body}")
-    log.info("=" * 60)
-    return True
-
-
 @app.route('/health')
 def health():
+    smtp = transport.smtp_config_summary()
     return jsonify({
         "status": "healthy",
         "service": "email-service",
         "language": "Python",
-        "mode": "STUB — logs to console, no real email sent",
-        "scope": "Account verification magic links ONLY. Not a login mechanism."
+        "tiers": ["system", "social", "personal", "confidential", "restricted"],
+        "transport": smtp,
+        "encryption": "stubbed — logs intent, sends plaintext",
+        "auth": "stubbed — always authorized (policy enforced structurally)",
     })
 
 
-@app.route('/send/verification', methods=['POST'])
-def send_verification():
-    """Send account verification magic link to new user."""
-    data = request.get_json(silent=True) or {}
+@app.route('/send', methods=['POST'])
+def send():
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({
+            "status": "rejected",
+            "message_id": None,
+            "enforced_tier": None,
+            "encrypted": None,
+            "error": {"code": "invalid_schema", "message": "Request body must be JSON"}
+        }), 400
 
-    email = data.get('email')
-    token = data.get('token')
-    display_name = data.get('displayName', 'Player')
+    caller = data.get('caller', {})
+    recipient = data.get('recipient', {})
+    options = data.get('options', {})
 
-    if not email or not token:
-        return jsonify({"error": "email and token required"}), 400
-
-    verify_url = f"http://localhost:8080/api/auth/verify?token={token}"
-
-    subject = "Verify your Swarm Blackjack account"
-    body = (
-        f"Hi {display_name},\n\n"
-        f"Click the link below to verify your account:\n"
-        f"{verify_url}\n\n"
-        f"This link expires in 24 hours.\n\n"
-        f"Note: This is a one-time link for account setup only.\n"
-        f"Future logins use your passkey — no passwords, no magic links."
+    req = pipeline.SendRequest(
+        calling_service=caller.get('service', ''),
+        request_id=caller.get('request_id', ''),
+        tier=data.get('tier', ''),
+        message_type=data.get('message_type', ''),
+        recipient_type=recipient.get('type', ''),
+        recipient_value=recipient.get('value', ''),
+        payload=data.get('payload', {}),
+        encryption_waived=options.get('encryption_waived', False),
+        waiver_token=options.get('waiver_token'),
     )
 
-    success = send_email(email, subject, body)
+    result = pipeline.process(req)
 
+    response_body = {
+        "status": result.status,
+        "message_id": result.message_id,
+        "enforced_tier": result.enforced_tier,
+        "encrypted": result.encrypted,
+        "error": {
+            "code": result.error_code,
+            "message": result.error_message,
+        } if result.error_code else None,
+    }
+
+    status_code = 202 if result.status == "queued" else 400 if result.status == "rejected" else 500
+    return jsonify(response_body), status_code
+
+
+@app.route('/message-types', methods=['GET'])
+def message_type_list():
     return jsonify({
-        "sent": success,
-        "to": email,
-        "stub": True,
-        "note": "Check service logs for email content"
+        name: {
+            "minimum_tier": spec.minimum_tier,
+            "required_fields": spec.required_fields,
+            "description": spec.description,
+        }
+        for name, spec in templates.MESSAGE_TYPES.items()
     })
 
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 3008))
-    log.info(f"📧 Email Service (Python STUB) starting on :{port}")
-    log.info("   Logging to console only. No real email sent.")
-    log.info("   Swap send_email() for production SMTP/SendGrid/SES.")
+    log.info(f"Email Service (Python) starting on :{port}")
+    log.info("  All tiers: system / social / personal / confidential / restricted")
+    smtp = transport.smtp_config_summary()
+    log.info(f"  Transport: SMTP {smtp['host']}:{smtp['port']} (mode={smtp['mode']})")
+    log.info("  Auth/OPA:  STUB (structurally enforced)")
+    log.info("  Crypto:    STUB (plaintext, intent logged)")
     app.run(host='0.0.0.0', port=port)

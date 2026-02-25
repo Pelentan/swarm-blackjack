@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { GameState, SSEGameEvent, PlayerAction } from '../types';
 
-const GATEWAY_URL = process.env.REACT_APP_GATEWAY_URL || 'http://localhost:8080';
+const GATEWAY_URL = import.meta.env.VITE_GATEWAY_URL || '';
 const DEMO_TABLE_ID = 'demo-table-00000000-0000-0000-0000-000000000001';
 
 interface UseGameStateReturn {

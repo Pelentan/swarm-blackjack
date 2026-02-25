@@ -1,13 +1,13 @@
-FROM golang:1.22-alpine AS builder
+FROM golang:1.22 AS builder
 WORKDIR /app
-COPY go.mod .
+COPY go.mod go.sum .
+ENV GONOSUMDB=* GOFLAGS=-insecure
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o gateway .
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o gateway .
 
-FROM alpine:3.19
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-COPY --from=builder /app/gateway .
+FROM scratch
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /app/gateway /gateway
 EXPOSE 8080
-CMD ["./gateway"]
+ENTRYPOINT ["/gateway"]

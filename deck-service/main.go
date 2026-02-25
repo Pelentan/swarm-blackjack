@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
@@ -126,6 +125,3 @@ func getEnv(key, fallback string) string {
 	}
 	return fallback
 }
-
-// suppress unused import
-var _ = fmt.Sprintf

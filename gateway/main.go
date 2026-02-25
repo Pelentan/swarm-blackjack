@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,8 +10,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // ObservabilityEvent represents a service-to-service call for the dashboard
@@ -69,11 +73,12 @@ var (
 	bus = NewObservabilityBus()
 
 	serviceURLs = map[string]string{
-		"game-state":  getEnv("GAME_STATE_URL", "http://game-state:3001"),
-		"auth":        getEnv("AUTH_URL", "http://auth-service:3006"),
-		"bank":        getEnv("BANK_URL", "http://bank-service:3005"),
-		"chat":        getEnv("CHAT_URL", "http://chat-service:3007"),
-		"observability": getEnv("OBSERVABILITY_URL", "http://observability:3009"),
+		"game-state":    getEnv("GAME_STATE_URL", "http://game-state:3001"),
+		"auth":          getEnv("AUTH_URL", "http://auth-service:3006"),
+		"auth-ui":       getEnv("AUTH_UI_URL", "http://auth-ui-service:3010"),
+		"bank":          getEnv("BANK_URL", "http://bank-service:3005"),
+		"chat":          getEnv("CHAT_URL", "http://chat-service:3007"),
+		"email":         getEnv("EMAIL_URL", "http://email-service:3008"),
 	}
 )
 
@@ -93,27 +98,87 @@ func main() {
 	// Observability SSE feed (no auth — dashboard is internal)
 	mux.HandleFunc("/events", observabilitySSEHandler)
 
-	// Game routes → game-state service
-	mux.HandleFunc("/api/game/", instrumentedProxy("game-state", serviceURLs["game-state"]))
+	// Game routes → game-state service (/api/game/* → /tables/*)
+	mux.HandleFunc("/api/game/", instrumentedProxyWithRewrite("game-state", serviceURLs["game-state"], "/api/game/", "/tables/"))
 
-	// Auth routes → auth service
-	mux.HandleFunc("/api/auth/", instrumentedProxy("auth", serviceURLs["auth"]))
+	// Auth routes → auth service (/api/auth/* → /*)
+	mux.HandleFunc("/api/auth/", instrumentedProxyWithRewrite("auth", serviceURLs["auth"], "/api/auth/", "/"))
 
-	// Bank routes → bank service (auth required)
-	mux.HandleFunc("/api/bank/", requireAuth(instrumentedProxy("bank", serviceURLs["bank"])))
+	// Email verification link — gateway is the public entry point, routes internally
+	// /verify?token=... → auth-service /verify-token?token=... (returns redirect to UI)
+	mux.HandleFunc("/verify", instrumentedProxyWithRewrite("auth", serviceURLs["auth"], "/verify", "/verify-token"))
 
-	// Chat WebSocket → chat service
-	mux.HandleFunc("/api/chat/", instrumentedProxy("chat", serviceURLs["chat"]))
+	// Auth UI routes → auth-ui-service (/api/auth-ui/* → /*) — frontend-facing, no auth required
+	mux.HandleFunc("/api/auth-ui/", instrumentedProxyWithRewrite("auth-ui", serviceURLs["auth-ui"], "/api/auth-ui/", "/"))
+
+	// Bank routes → bank service (/api/bank/* → /*)
+	mux.HandleFunc("/api/bank/", requireAuth(instrumentedProxyWithRewrite("bank", serviceURLs["bank"], "/api/bank/", "/")))
+
+	// Chat routes → chat service (/api/chat/* → /*)
+	mux.HandleFunc("/api/chat/", instrumentedProxyWithRewrite("chat", serviceURLs["chat"], "/api/chat/", "/"))
+
+	// Email routes → email service (/api/email/* → /*)
+	mux.HandleFunc("/api/email/", instrumentedProxyWithRewrite("email", serviceURLs["email"], "/api/email/", "/"))
 
 	port := getEnv("PORT", "8080")
-	log.Printf("🚀 API Gateway starting on :%s", port)
-	log.Printf("   game-state  → %s", serviceURLs["game-state"])
-	log.Printf("   auth        → %s", serviceURLs["auth"])
-	log.Printf("   bank        → %s", serviceURLs["bank"])
-	log.Printf("   chat        → %s", serviceURLs["chat"])
+	log.Printf("[gateway] starting on :%s", port)
+
+	// Subscribe to Redis for internal service events
+	go subscribeRedis()
 
 	if err := http.ListenAndServe(":"+port, corsMiddleware(mux)); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// instrumentedProxyWithRewrite proxies with prefix rewriting e.g. /api/game/ → /tables/
+func instrumentedProxyWithRewrite(callee, targetURL, stripPrefix, addPrefix string) http.HandlerFunc {
+	target, err := url.Parse(targetURL)
+	if err != nil {
+		log.Fatalf("invalid upstream URL for %s: %v", callee, err)
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.Director = func(req *http.Request) {
+		req.URL.Scheme = target.Scheme
+		req.URL.Host = target.Host
+		req.Host = target.Host
+		// Rewrite path: strip incoming prefix, add upstream prefix
+		path := strings.TrimPrefix(req.URL.Path, stripPrefix)
+		req.URL.Path = addPrefix + path
+		if req.URL.RawPath != "" {
+			rawPath := strings.TrimPrefix(req.URL.RawPath, stripPrefix)
+			req.URL.RawPath = addPrefix + rawPath
+		}
+	}
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		log.Printf("proxy error [%s]: %v", callee, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]string{
+			"code":    "upstream_error",
+			"message": fmt.Sprintf("%s service unavailable", callee),
+		})
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		isSSE := r.Header.Get("Accept") == "text/event-stream"
+		rw := &statusRecorder{ResponseWriter: w, status: 200}
+		proxy.ServeHTTP(rw, r)
+		latency := time.Since(start).Milliseconds()
+		bus.Publish(ObservabilityEvent{
+			ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Caller:    "gateway",
+			Callee:    callee,
+			Method:    r.Method,
+			Path:      r.URL.Path,
+			Protocol:  protocolFor(isSSE, r),
+			StatusCode: rw.status,
+			LatencyMs:  latency,
+		})
+		log.Printf("[gateway→%s] %s %s %d (%dms)", callee, r.Method, r.URL.Path, rw.status, latency)
 	}
 }
 
@@ -229,6 +294,49 @@ func observabilitySSEHandler(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+	}
+}
+
+// subscribeRedis subscribes to the observability Redis channel and feeds
+// events into the local bus so SSE clients see internal service calls.
+func subscribeRedis() {
+	redisAddr := getEnv("REDIS_URL", "redis:6379")
+
+	// Retry until Redis is ready
+	var rdb *redis.Client
+	for i := 0; i < 10; i++ {
+		rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := rdb.Ping(ctx).Err()
+		cancel()
+		if err == nil {
+			log.Printf("[gateway] Redis connected at %s", redisAddr)
+			break
+		}
+		log.Printf("[gateway] Redis not ready (%d/10), retrying...", i+1)
+		rdb.Close()
+		rdb = nil
+		time.Sleep(2 * time.Second)
+	}
+	if rdb == nil {
+		log.Printf("[gateway] Redis unavailable — internal events will not appear on dashboard")
+		return
+	}
+	defer rdb.Close()
+
+	sub := rdb.Subscribe(context.Background(), "swarm:events")
+	defer sub.Close()
+
+	log.Printf("[gateway] subscribed to Redis channel swarm:events")
+
+	ch := sub.Channel()
+	for msg := range ch {
+		var evt ObservabilityEvent
+		if err := json.Unmarshal([]byte(msg.Payload), &evt); err != nil {
+			log.Printf("[gateway] redis event parse error: %v", err)
+			continue
+		}
+		bus.Publish(evt)
 	}
 }
 
