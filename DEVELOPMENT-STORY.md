@@ -151,4 +151,4 @@ If you have questions about specific decisions — why a particular language, wh
 
 ---
 
-*Built with Claude (Anthropic) as AI partner. All architectural decisions, security design, and engineering judgment by Michael Pelen.*
+*Built with Claude (Anthropic) as AI partner. All architectural decisions, security design, and engineering judgment by Michael E. Shaffer.*
