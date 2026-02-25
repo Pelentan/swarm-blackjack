@@ -1,3 +1,92 @@
-
-# Credentials — never commit
+# ── Credentials — never commit ────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
+
+# Key material and certificates — all formats
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+*.der
+*.jks
+*.keystore
+*.truststore
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_ecdsa
+id_ecdsa.*
+
+# Postfix SASL credentials
+sasl_passwd
+sasl_passwd.db
+
+# Certs directory — generated locally by gen-certs.sh, never committed
+infra/certs/
+
+# AWS / cloud credentials
+.aws/
+credentials
+*.credentials
+
+# Other secrets
+*secret*
+*password*
+*token*
+*.vault
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editors ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── Node ──────────────────────────────────────────────────────────────────────
+node_modules/
+dist/
+.npm/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ── Go ────────────────────────────────────────────────────────────────────────
+*.exe
+*.test
+
+# ── Java ──────────────────────────────────────────────────────────────────────
+*.class
+target/
+
+# ── Haskell ───────────────────────────────────────────────────────────────────
+dist-newstyle/
+.cabal-sandbox/
+cabal.sandbox.config
+*.hi
+*.o
+
+# ── Elixir ────────────────────────────────────────────────────────────────────
+_build/
+deps/
+*.ez
+
+# ── Docker ────────────────────────────────────────────────────────────────────
+.docker/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/

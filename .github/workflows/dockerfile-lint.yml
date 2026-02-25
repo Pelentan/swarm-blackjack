@@ -1,0 +1,31 @@
+name: Dockerfile Lint
+
+on:
+  push:
+    branches: [ master, main ]
+    paths:
+      - '**/Dockerfile'
+      - 'docker-compose.yml'
+  pull_request:
+    branches: [ master, main ]
+    paths:
+      - '**/Dockerfile'
+      - 'docker-compose.yml'
+
+jobs:
+  hadolint:
+    name: Hadolint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Lint all Dockerfiles
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          recursive: true
+          # Ignore rules that conflict with intentional decisions in this stack:
+          # DL3008 — we intentionally pin some apt packages
+          # DL3018 — apk version pinning (Alpine remnants during transition)
+          ignore: DL3008,DL3018
+          failure-threshold: warning
