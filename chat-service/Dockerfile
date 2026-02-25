@@ -10,6 +10,7 @@ RUN MIX_ENV=prod mix compile
 
 FROM elixir:1.16
 WORKDIR /app
+RUN mix local.hex --force && mix local.rebar --force
 COPY --from=builder /app ./
 EXPOSE 3007
 ENV MIX_ENV=prod
