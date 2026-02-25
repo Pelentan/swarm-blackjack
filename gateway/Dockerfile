@@ -1,6 +1,6 @@
 FROM golang:1.22 AS builder
 WORKDIR /app
-COPY go.mod go.sum .
+COPY go.mod go.sum ./
 ENV GONOSUMDB=* GOFLAGS=-insecure
 RUN go mod download
 COPY . .
