@@ -41,8 +41,7 @@ jobs:
       - name: Build Java (bank-service)
         if: matrix.language == 'java-kotlin'
         run: |
-          mkdir -p bank-service/com/swarmblackjack/bank
-          javac -d bank-service bank-service/com/swarmblackjack/bank/BankService.java
+          javac bank-service/BankService.java
 
       # Everything else: autobuild handles it
       - name: Autobuild
