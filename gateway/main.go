@@ -73,12 +73,13 @@ var (
 	bus = NewObservabilityBus()
 
 	serviceURLs = map[string]string{
-		"game-state":    getEnv("GAME_STATE_URL", "http://game-state:3001"),
-		"auth":          getEnv("AUTH_URL", "http://auth-service:3006"),
-		"auth-ui":       getEnv("AUTH_UI_URL", "http://auth-ui-service:3010"),
-		"bank":          getEnv("BANK_URL", "http://bank-service:3005"),
-		"chat":          getEnv("CHAT_URL", "http://chat-service:3007"),
-		"email":         getEnv("EMAIL_URL", "http://email-service:3008"),
+		"game-state": getEnv("GAME_STATE_URL", "http://game-state:3001"),
+		"auth":       getEnv("AUTH_URL", "http://auth-service:3006"),
+		"auth-ui":    getEnv("AUTH_UI_URL", "http://auth-ui-service:3010"),
+		"bank":       getEnv("BANK_URL", "http://bank-service:3005"),
+		"chat":       getEnv("CHAT_URL", "http://chat-service:3007"),
+		"email":      getEnv("EMAIL_URL", "http://email-service:3008"),
+		"ui":         getEnv("UI_URL", "http://ui:3000"),
 	}
 )
 
@@ -120,7 +121,11 @@ func main() {
 	// Email routes → email service (/api/email/* → /*)
 	mux.HandleFunc("/api/email/", instrumentedProxyWithRewrite("email", serviceURLs["email"], "/api/email/", "/"))
 
-	port := getEnv("PORT", "8080")
+	// UI catch-all — must be last. Proxies everything else to the UI container.
+	// In production this would be a CDN or static file server.
+	mux.HandleFunc("/", instrumentedProxy("ui", serviceURLs["ui"]))
+
+	port := getEnv("PORT", "8021")
 	log.Printf("[gateway] starting on :%s", port)
 
 	// Subscribe to Redis for internal service events

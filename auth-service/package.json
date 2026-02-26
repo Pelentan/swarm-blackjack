@@ -1,6 +1,6 @@
 {
   "name": "auth-service",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Swarm Blackjack — Auth Service (TypeScript)",
   "main": "dist/index.js",
   "scripts": {
@@ -9,13 +9,16 @@
     "dev": "ts-node index.ts"
   },
   "dependencies": {
+    "@simplewebauthn/server": "^10.0.0",
     "ioredis": "^5.3.2",
-    "jsonwebtoken": "^9.0.2"
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.3"
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
-    "@types/node": "^20.0.0",
     "@types/jsonwebtoken": "^9.0.6",
-    "ts-node": "^10.9.0"
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.4.0"
   }
 }

@@ -1,7 +1,7 @@
 FROM node:20-slim AS builder
 WORKDIR /app
-COPY package.json .
-RUN npm install
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY index.html vite.config.ts tsconfig.json ./
 COPY src ./src
 ARG VITE_GATEWAY_URL=

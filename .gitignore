@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+auth.env
+!auth.env.example
 
 # Key material and certificates — all formats
 *.key

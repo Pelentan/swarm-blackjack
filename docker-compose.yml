@@ -21,6 +21,7 @@ networks:
 volumes:
   game-db-data:
   bank-db-data:
+  auth-db-data:
   redis-data:
 
 services:
@@ -30,15 +31,16 @@ services:
     build: ./gateway
     container_name: swarm-gateway
     ports:
-      - "8080:8080"
+      - "8021:8021"
     environment:
-      PORT: "8080"
+      PORT: "8021"
       GAME_STATE_URL: "http://game-state:3001"
       AUTH_URL: "http://auth-service:3006"
       AUTH_UI_URL: "http://auth-ui-service:3010"
       BANK_URL: "http://bank-service:3005"
       CHAT_URL: "http://chat-service:3007"
       EMAIL_URL: "http://email-service:3008"
+      UI_URL: "http://ui:3000"
       REDIS_URL: "redis:6379"
     networks:
       - swarm-net
@@ -49,7 +51,7 @@ services:
       - observability-service
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8021/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -126,6 +128,8 @@ services:
   auth-service:
     build: ./auth-service
     container_name: swarm-auth
+    env_file:
+      - auth.env
     environment:
       PORT: "3006"
       REDIS_URL: "redis://redis:6379"
@@ -133,12 +137,13 @@ services:
       EMAIL_URL: "http://email-service:3008"
       BANK_URL: "http://bank-service:3005"
       # Verification links go through gateway so UI topology stays internal
-      GATEWAY_URL: "http://localhost:8080"
-      UI_URL: "http://localhost:3000"
+      GATEWAY_URL: "http://localhost:8021"
+      UI_URL: "http://localhost:8021"
     networks:
       - swarm-net
     depends_on:
       - redis
+      - auth-db
       - email-service
       - bank-service
       - postfix
@@ -244,8 +249,6 @@ services:
       args:
         VITE_GATEWAY_URL: ""
     container_name: swarm-ui
-    ports:
-      - "3000:3000"
     networks:
       - swarm-net
     depends_on:
@@ -280,6 +283,21 @@ services:
       - swarm-net
     restart: unless-stopped
     # Completely isolated — bank-service is the ONLY service with these credentials
+
+  auth-db:
+    image: postgres:16-alpine
+    container_name: swarm-auth-db
+    environment:
+      POSTGRES_DB: authdb
+      POSTGRES_USER: authuser
+      POSTGRES_PASSWORD: authpass_dev
+    volumes:
+      - auth-db-data:/var/lib/postgresql/data
+      - ./auth-db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    # Completely isolated — auth-service is the ONLY service with these credentials
 
   redis:
     image: redis:7-alpine

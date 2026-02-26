@@ -1,15 +1,19 @@
-// Auth UI Service
+// Auth UI Service v0.2.0
 // ===============
 // Language : Go
 // Container: Scratch (static binary, no shell)
 //
 // Owns the auth form flow. Frontend-facing.
 // Returns field definitions so the modal is server-driven.
-// Orchestrates calls to auth-service — never touches JWT internals.
+// Orchestrates calls to auth-service — browser never touches auth-service directly.
 //
 // Endpoints:
 //   GET  /fields?action=register|login  — field definitions for modal
 //   POST /submit                        — validate + forward to auth-service
+//   POST /passkey/register/begin        — proxy to auth-service (requires JWT)
+//   POST /passkey/register/complete     — proxy to auth-service (requires JWT)
+//   POST /passkey/login/begin           — proxy to auth-service
+//   POST /passkey/login/complete        — proxy to auth-service
 //   GET  /health
 
 package main
@@ -37,7 +41,7 @@ var (
 type Field struct {
 	Name        string `json:"name"`
 	Label       string `json:"label"`
-	Type        string `json:"type"`   // text | email | password
+	Type        string `json:"type"`
 	Required    bool   `json:"required"`
 	Placeholder string `json:"placeholder"`
 	MaxLength   int    `json:"maxLength,omitempty"`
@@ -46,7 +50,7 @@ type Field struct {
 type FieldsResponse struct {
 	Action string  `json:"action"`
 	Title  string  `json:"title"`
-	Submit string  `json:"submit"`   // button label
+	Submit string  `json:"submit"`
 	Fields []Field `json:"fields"`
 }
 
@@ -55,38 +59,20 @@ var registerFields = FieldsResponse{
 	Title:  "Create Account",
 	Submit: "Register",
 	Fields: []Field{
-		{
-			Name:        "name",
-			Label:       "Display Name",
-			Type:        "text",
-			Required:    true,
-			Placeholder: "How should we call you?",
-			MaxLength:   50,
-		},
-		{
-			Name:        "email",
-			Label:       "Email Address",
-			Type:        "email",
-			Required:    true,
-			Placeholder: "you@example.com",
-			MaxLength:   255,
-		},
+		{Name: "name", Label: "Display Name", Type: "text", Required: true,
+			Placeholder: "How should we call you?", MaxLength: 50},
+		{Name: "email", Label: "Email Address", Type: "email", Required: true,
+			Placeholder: "you@example.com", MaxLength: 255},
 	},
 }
 
 var loginFields = FieldsResponse{
 	Action: "login",
 	Title:  "Sign In",
-	Submit: "Sign In",
+	Submit: "Sign In with Passkey",
 	Fields: []Field{
-		{
-			Name:        "email",
-			Label:       "Email Address",
-			Type:        "email",
-			Required:    true,
-			Placeholder: "you@example.com",
-			MaxLength:   255,
-		},
+		{Name: "email", Label: "Email Address", Type: "email", Required: true,
+			Placeholder: "you@example.com", MaxLength: 255},
 	},
 }
 
@@ -106,34 +92,29 @@ type ValidationError struct {
 
 func validateRegister(fields map[string]string) []ValidationError {
 	var errs []ValidationError
-
 	name := strings.TrimSpace(fields["name"])
 	if name == "" {
 		errs = append(errs, ValidationError{"name", "Display name is required"})
 	} else if len(name) > 50 {
 		errs = append(errs, ValidationError{"name", "Display name must be 50 characters or less"})
 	}
-
 	email := strings.TrimSpace(fields["email"])
 	if email == "" {
 		errs = append(errs, ValidationError{"email", "Email address is required"})
 	} else if !emailRegex.MatchString(email) {
 		errs = append(errs, ValidationError{"email", "Please enter a valid email address"})
 	}
-
 	return errs
 }
 
 func validateLogin(fields map[string]string) []ValidationError {
 	var errs []ValidationError
-
 	email := strings.TrimSpace(fields["email"])
 	if email == "" {
 		errs = append(errs, ValidationError{"email", "Email address is required"})
 	} else if !emailRegex.MatchString(email) {
 		errs = append(errs, ValidationError{"email", "Please enter a valid email address"})
 	}
-
 	return errs
 }
 
@@ -145,7 +126,6 @@ type AuthResult struct {
 	PlayerID    string `json:"playerId"`
 	PlayerName  string `json:"playerName"`
 	Email       string `json:"email"`
-	Note        string `json:"note,omitempty"`
 }
 
 func forwardToAuth(action string, fields map[string]string) (*AuthResult, int, string) {
@@ -203,6 +183,44 @@ func forwardToAuth(action string, fields map[string]string) (*AuthResult, int, s
 	return &result, resp.StatusCode, ""
 }
 
+// proxyToAuth transparently forwards a request to auth-service, preserving
+// the Authorization header and body. Used for passkey ceremony endpoints.
+func proxyToAuth(w http.ResponseWriter, r *http.Request, authPath string) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "failed to read request body"})
+		return
+	}
+
+	req, err := http.NewRequest(r.Method, authServiceURL+authPath, bytes.NewReader(body))
+	if err != nil {
+		writeJSON(w, 500, map[string]string{"error": "failed to create upstream request"})
+		return
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		req.Header.Set("Authorization", auth)
+	}
+
+	start := time.Now()
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[auth-ui] auth-service unreachable at %s (%dms): %v", authPath, time.Since(start).Milliseconds(), err)
+		writeJSON(w, 503, map[string]string{"error": "authentication service unavailable"})
+		return
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	log.Printf("[auth-ui] proxy %s → %d (%dms)", authPath, resp.StatusCode, time.Since(start).Milliseconds())
+
+	corsHeaders(w)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(respBody)
+}
+
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
 func corsHeaders(w http.ResponseWriter) {
@@ -228,9 +246,7 @@ func fieldsHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
 		return
 	}
-
-	action := r.URL.Query().Get("action")
-	switch action {
+	switch r.URL.Query().Get("action") {
 	case "register":
 		writeJSON(w, 200, registerFields)
 	case "login":
@@ -256,12 +272,10 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
-
 	if req.Fields == nil {
 		req.Fields = map[string]string{}
 	}
 
-	// Validate locally first — don't hit auth-service with obviously bad input
 	var validationErrs []ValidationError
 	switch req.Action {
 	case "register":
@@ -274,14 +288,10 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(validationErrs) > 0 {
-		writeJSON(w, 422, map[string]any{
-			"error":  "validation failed",
-			"fields": validationErrs,
-		})
+		writeJSON(w, 422, map[string]any{"error": "validation failed", "fields": validationErrs})
 		return
 	}
 
-	// Forward to auth-service
 	result, status, errMsg := forwardToAuth(req.Action, req.Fields)
 	if errMsg != "" {
 		writeJSON(w, status, map[string]string{"error": errMsg})
@@ -294,12 +304,27 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 		"playerId":    result.PlayerID,
 		"playerName":  result.PlayerName,
 		"email":       result.Email,
-		"note":        result.Note,
 	})
 }
 
+// passkeyHandler routes /passkey/* to the appropriate auth-service endpoint
+func passkeyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		corsHeaders(w)
+		w.WriteHeader(204)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]string{"error": "method not allowed"})
+		return
+	}
+
+	// Strip /passkey prefix — auth-service uses the same path structure
+	authPath := "/passkey" + strings.TrimPrefix(r.URL.Path, "/passkey")
+	proxyToAuth(w, r, authPath)
+}
+
 func healthHandler(w http.ResponseWriter, r *http.Request) {
-	// Probe auth-service
 	authStatus := "unreachable"
 	resp, err := http.Get(authServiceURL + "/health")
 	if err == nil {
@@ -308,14 +333,13 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 			authStatus = "reachable"
 		}
 	}
-
 	writeJSON(w, 200, map[string]any{
 		"status":       "healthy",
 		"service":      "auth-ui-service",
 		"language":     "Go",
 		"container":    "scratch",
 		"auth_service": authStatus,
-		"actions":      []string{"register", "login"},
+		"actions":      []string{"register", "login", "passkey/register", "passkey/login"},
 	})
 }
 
@@ -332,11 +356,11 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/fields", fieldsHandler)
 	mux.HandleFunc("/submit", submitHandler)
+	mux.HandleFunc("/passkey/", passkeyHandler)
 	mux.HandleFunc("/health", healthHandler)
 
 	log.Printf("[auth-ui-service] starting on :%s", port)
 	log.Printf("[auth-ui-service] auth-service: %s", authServiceURL)
-	log.Printf("[auth-ui-service] actions: register, login")
 
 	if err := http.ListenAndServe(fmt.Sprintf(":%s", port), mux); err != nil {
 		log.Fatal(err)
