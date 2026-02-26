@@ -67,13 +67,14 @@ public class BankService {
         int port = Integer.parseInt(System.getenv().getOrDefault("PORT", "3005"));
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
-        server.createContext("/health",   new HealthHandler());
-        server.createContext("/account",  new AccountHandler());
-        server.createContext("/balance",  new BalanceHandler());
-        server.createContext("/bet",      new BetHandler());
-        server.createContext("/payout",   new PayoutHandler());
-        server.createContext("/deposit",  new DepositHandler());
-        server.createContext("/withdraw", new WithdrawHandler());
+        server.createContext("/health",    new HealthHandler());
+        server.createContext("/account",   new AccountHandler());
+        server.createContext("/balance",   new BalanceHandler());
+        server.createContext("/bet",       new BetHandler());
+        server.createContext("/payout",    new PayoutHandler());
+        server.createContext("/deposit",   new DepositHandler());
+        server.createContext("/withdraw",  new WithdrawHandler());
+        server.createContext("/dev/reset", new DevResetHandler());
         server.setExecutor(null);
         server.start();
 
@@ -404,4 +405,26 @@ public class BankService {
         if (end < 0) return null;
         return json.substring(start, end);
     }
+
+    // ── DEV ONLY ──────────────────────────────────────────────────────────────
+
+    static class DevResetHandler implements HttpHandler {
+        @Override
+        public void handle(HttpExchange ex) throws IOException {
+            ex.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
+            ex.getResponseHeaders().set("Access-Control-Allow-Methods", "POST, OPTIONS");
+            if ("OPTIONS".equals(ex.getRequestMethod())) { ex.sendResponseHeaders(204, -1); return; }
+            if (!"POST".equals(ex.getRequestMethod())) {
+                sendJson(ex, 405, "{\"error\":\"method not allowed\"}");
+                return;
+            }
+            balances.clear();
+            openBets.clear();
+            // Re-seed demo player
+            balances.put("player-00000000-0000-0000-0000-000000000001", new BigDecimal("1000.00"));
+            log.warning("DEV RESET: all balances and open bets cleared, demo player re-seeded");
+            sendJson(ex, 200, "{\"reset\":true,\"service\":\"bank-service\"}");
+        }
+    }
+
 }

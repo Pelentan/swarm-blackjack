@@ -1,87 +1,29 @@
 # CHANGED_FILES.md
 
-**Date:** 2026-02-23 17:00 UTC  
-**Feature:** Initial skeleton — full swarm, all services running, SSE to UI  
-**Files Added:** 47  
-**Files Modified:** 0
+**Date:** 2026-02-26 19:00 UTC  
+**Feature:** Fix unhealthy containers — add wget to all services missing it  
+**Files Modified:** 8
 
-## What This Delivers
+## Files Modified
 
-`docker compose up --build` → cards dealt across 6 languages, visible in browser, observability panel shows live inter-service calls.
+- `gateway/Dockerfile` — add busybox static wget at /wget
+- `game-state/Dockerfile` — add busybox static wget at /wget
+- `deck-service/Dockerfile` — add busybox static wget at /wget
+- `auth-ui-service/Dockerfile` — add busybox static wget at /wget
+- `hand-evaluator/Dockerfile` — add wget to existing apt-get install
+- `dealer-ai/Dockerfile` — add busybox static wget at /usr/local/bin/wget
+- `auth-service/Dockerfile` — add busybox static wget at /usr/local/bin/wget (final stage)
+- `docker-compose.yml` — scratch container healthchecks updated to /wget full path; auth-ui-service changed from CMD-SHELL to CMD
 
-## Directory Structure Created
+## Root Cause
 
-```
-swarm-blackjack/
-├── README.md
-├── contracts/openapi/
-│   ├── gateway.yaml          ← Full OpenAPI spec, all routes
-│   ├── game-state.yaml       ← Full OpenAPI spec, SSE + actions
-│   └── deck-service.yaml     ← Full OpenAPI spec, shoe management
-├── gateway/                  ← Go — real, routes + observability SSE
-│   ├── main.go
-│   ├── go.mod
-│   └── Dockerfile
-├── game-state/               ← Go — real, SSE + demo loop calling stubs
-│   ├── main.go
-│   ├── go.mod
-│   └── Dockerfile
-├── deck-service/             ← Go — real shuffle/deal logic
-│   ├── main.go
-│   ├── go.mod
-│   └── Dockerfile
-├── hand-evaluator/           ← Haskell — pure function, real eval logic
-│   ├── Main.hs
-│   ├── hand-evaluator.cabal
-│   └── Dockerfile
-├── dealer-ai/                ← Python — real rule-based strategy
-│   ├── main.py
-│   ├── requirements.txt
-│   └── Dockerfile
-├── bank-service/             ← Java — stub, real BigDecimal arithmetic
-│   ├── BankService.java
-│   └── Dockerfile
-├── auth-service/             ← TypeScript — stub, passkey flow documented
-│   ├── index.ts
-│   ├── package.json
-│   ├── tsconfig.json
-│   └── Dockerfile
-├── chat-service/             ← Elixir — HTTP stub, OTP structure in place
-│   ├── mix.exs
-│   ├── Dockerfile
-│   └── lib/chat_service/
-│       ├── application.ex
-│       ├── router.ex
-│       └── table_registry.ex
-├── email-service/            ← Python — stub, logs to console
-│   ├── main.py
-│   ├── requirements.txt
-│   └── Dockerfile
-├── ui/                       ← React/TypeScript — live SSE, game table, observability
-│   ├── package.json
-│   ├── Dockerfile
-│   ├── nginx.conf
-│   ├── public/index.html
-│   └── src/
-│       ├── App.tsx
-│       ├── index.tsx
-│       ├── types/index.ts
-│       ├── hooks/useGameState.ts
-│       └── components/
-│           ├── Card.tsx
-│           ├── GameTable.tsx
-│           └── ObservabilityPanel.tsx
-└── infra/
-    ├── docker-compose.yml
-    └── scripts/gen-certs.sh
+Two separate issues:
+- **Scratch containers** (gateway, game-state, deck-service, auth-ui-service): no shell, no tools, `wget` doesn't exist. Healthcheck CMD also changed from `wget` to `/wget` since PATH resolution doesn't apply in scratch.
+- **Slim containers** (hand-evaluator/debian:bookworm-slim, dealer-ai/python:3.12-slim, auth-service/node:20-slim): minimal base images don't include wget.
 
-```
+## Fix
 
-## Next Steps (not in this delivery)
-- Move docker-compose.yml to project root for convenience
-- Wire mTLS enforcement into each service using generated certs
-- OPA policy engine integration in auth-service
-- WebSocket chat in Elixir chat-service
-- Real passkey ceremony (simplewebauthn)
-- Multi-table UI
-- Game history PostgreSQL schema + migrations
+Uniform approach: copy static busybox wget binary into all affected containers.
+- Scratch: `COPY --from=busybox:1.36 /bin/wget /wget` → healthcheck uses `/wget`
+- Non-scratch: `COPY --from=busybox:1.36 /bin/wget /usr/local/bin/wget` → on PATH, no compose change
+- hand-evaluator: added `wget` to existing apt-get line (already had apt-get, cleaner than copying)

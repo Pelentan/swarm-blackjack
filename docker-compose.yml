@@ -51,7 +51,7 @@ services:
       - observability-service
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8021/health"]
+      test: ["CMD", "/wget", "-qO-", "http://localhost:8021/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -77,7 +77,7 @@ services:
       - bank-service
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3001/health"]
+      test: ["CMD", "/wget", "-qO-", "http://localhost:3001/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -91,7 +91,7 @@ services:
       - swarm-net
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3002/health"]
+      test: ["CMD", "/wget", "-qO-", "http://localhost:3002/health"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -166,7 +166,7 @@ services:
       - auth-service
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:3010/health || exit 1"]
+      test: ["CMD", "/wget", "-qO-", "http://localhost:3010/health"]
       interval: 10s
       timeout: 5s
       retries: 3

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -99,27 +100,35 @@ func main() {
 	// Observability SSE feed (no auth — dashboard is internal)
 	mux.HandleFunc("/events", observabilitySSEHandler)
 
-	// Game routes → game-state service (/api/game/* → /tables/*)
+	// Game routes — SSE stream and table listing are public (EventSource can't send headers)
+	// Actions are open for now — will require session scope once player join flow is wired
 	mux.HandleFunc("/api/game/", instrumentedProxyWithRewrite("game-state", serviceURLs["game-state"], "/api/game/", "/tables/"))
 
 	// Auth routes → auth service (/api/auth/* → /*)
 	mux.HandleFunc("/api/auth/", instrumentedProxyWithRewrite("auth", serviceURLs["auth"], "/api/auth/", "/"))
 
-	// Email verification link — gateway is the public entry point, routes internally
+	// Email verification link
 	// /verify?token=... → auth-service /verify-token?token=... (returns redirect to UI)
 	mux.HandleFunc("/verify", instrumentedProxyWithRewrite("auth", serviceURLs["auth"], "/verify", "/verify-token"))
 
-	// Auth UI routes → auth-ui-service (/api/auth-ui/* → /*) — frontend-facing, no auth required
+	// Passkey registration — enroll or session scope required
+	// Must be registered before the general /api/auth-ui/ catch-all (longest prefix wins)
+	mux.HandleFunc("/api/auth-ui/passkey/register/", requireEnrollScope(instrumentedProxyWithRewrite("auth-ui", serviceURLs["auth-ui"], "/api/auth-ui/", "/")))
+
+	// Auth UI routes — public (login form, passkey login ceremony start)
 	mux.HandleFunc("/api/auth-ui/", instrumentedProxyWithRewrite("auth-ui", serviceURLs["auth-ui"], "/api/auth-ui/", "/"))
 
-	// Bank routes → bank service (/api/bank/* → /*)
-	mux.HandleFunc("/api/bank/", requireAuth(instrumentedProxyWithRewrite("bank", serviceURLs["bank"], "/api/bank/", "/")))
+	// Bank routes → bank service (/api/bank/* → /*) — session scope required
+	mux.HandleFunc("/api/bank/", requireSessionScope(instrumentedProxyWithRewrite("bank", serviceURLs["bank"], "/api/bank/", "/")))
 
 	// Chat routes → chat service (/api/chat/* → /*)
 	mux.HandleFunc("/api/chat/", instrumentedProxyWithRewrite("chat", serviceURLs["chat"], "/api/chat/", "/"))
 
 	// Email routes → email service (/api/email/* → /*)
 	mux.HandleFunc("/api/email/", instrumentedProxyWithRewrite("email", serviceURLs["email"], "/api/email/", "/"))
+
+	// DEV ONLY — wipe all state and re-seed
+	mux.HandleFunc("/dev/reset", devResetHandler)
 
 	// UI catch-all — must be last. Proxies everything else to the UI container.
 	// In production this would be a CDN or static file server.
@@ -245,12 +254,74 @@ func protocolFor(isSSE bool, r *http.Request) string {
 	return "http"
 }
 
-// requireAuth is a stub middleware — real JWT validation comes with Auth service
-func requireAuth(next http.HandlerFunc) http.HandlerFunc {
+// extractJWTClaims decodes JWT payload without signature verification.
+// Scope decisions are routing-only — auth-service still fully verifies on every call.
+func extractJWTClaims(r *http.Request) map[string]interface{} {
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return nil
+	}
+	parts := strings.Split(strings.TrimPrefix(auth, "Bearer "), ".")
+	if len(parts) != 3 {
+		return nil
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil
+	}
+	var claims map[string]interface{}
+	if err := json.Unmarshal(decoded, &claims); err != nil {
+		return nil
+	}
+	return claims
+}
+
+func scopeError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	json.NewEncoder(w).Encode(map[string]string{"code": code, "message": message})
+}
+
+// requireSessionScope enforces scope: "session" on protected routes.
+// 401 = no token. 403 = wrong token type (bootstrap token used on game route).
+func requireSessionScope(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// TODO: validate JWT from Authorization header
-		// For now: pass through with a stub player ID header
-		r.Header.Set("X-Player-ID", "stub-player-00000000-0000-0000-0000-000000000001")
+		claims := extractJWTClaims(r)
+		if claims == nil {
+			scopeError(w, http.StatusUnauthorized, "auth_required", "authentication required")
+			return
+		}
+		scope, _ := claims["scope"].(string)
+		if scope != "session" {
+			// 403 not 401 — they have a token, it's just the wrong type
+			scopeError(w, http.StatusForbidden, "wrong_token_scope",
+				"session token required — complete passkey enrollment first")
+			return
+		}
+		// Inject player ID for downstream services
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-Player-ID", sub)
+		}
+		next(w, r)
+	}
+}
+
+// requireEnrollScope accepts enroll or session scope — used on passkey registration endpoints.
+func requireEnrollScope(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		claims := extractJWTClaims(r)
+		if claims == nil {
+			scopeError(w, http.StatusUnauthorized, "auth_required", "authentication required")
+			return
+		}
+		scope, _ := claims["scope"].(string)
+		if scope != "enroll" && scope != "session" {
+			scopeError(w, http.StatusForbidden, "wrong_token_scope", "enroll or session token required")
+			return
+		}
+		if sub, ok := claims["sub"].(string); ok {
+			r.Header.Set("X-Player-ID", sub)
+		}
 		next(w, r)
 	}
 }
@@ -343,6 +414,52 @@ func subscribeRedis() {
 		}
 		bus.Publish(evt)
 	}
+}
+
+// devResetHandler fans out POST /dev/reset to auth-service and bank-service.
+// DEV ONLY — gate this off before production.
+func devResetHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	type result struct {
+		service string
+		ok      bool
+		msg     string
+	}
+
+	services := map[string]string{
+		"auth-service": serviceURLs["auth"] + "/dev/reset",
+		"bank-service": serviceURLs["bank"] + "/dev/reset",
+	}
+
+	results := make(map[string]string)
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for name, url := range services {
+		resp, err := client.Post(url, "application/json", nil)
+		if err != nil {
+			results[name] = "error: " + err.Error()
+			log.Printf("[gateway] dev/reset: %s failed: %v", name, err)
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == 200 {
+			results[name] = "ok"
+		} else {
+			results[name] = fmt.Sprintf("error: status %d", resp.StatusCode)
+		}
+	}
+
+	log.Printf("[gateway] DEV RESET executed: %v", results)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"reset":   true,
+		"results": results,
+	})
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {

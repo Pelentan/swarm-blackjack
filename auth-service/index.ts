@@ -81,15 +81,23 @@ redis.on('error',   (e) => console.error(`[${SERVICE}] Redis error:`, e.message)
 // ── Player operations ─────────────────────────────────────────────────────────
 
 interface Player {
-  id:        string;
-  email:     string;
-  name:      string;
-  verified:  boolean;
-  createdAt: string;
+  id:               string;
+  email:            string;
+  name:             string;
+  verified:         boolean;
+  passkeyEnrolled:  boolean;
+  createdAt:        string;
 }
 
 function rowToPlayer(row: any): Player {
-  return { id: row.id, email: row.email, name: row.name, verified: row.verified, createdAt: row.created_at };
+  return {
+    id:              row.id,
+    email:           row.email,
+    name:            row.name,
+    verified:        row.verified,
+    passkeyEnrolled: row.passkey_enrolled ?? false,
+    createdAt:       row.created_at,
+  };
 }
 
 async function findPlayerByEmail(email: string): Promise<Player | null> {
@@ -112,6 +120,10 @@ async function createPlayer(id: string, email: string, name: string): Promise<Pl
 
 async function markPlayerVerified(id: string): Promise<void> {
   await db.query('UPDATE players SET verified = true WHERE id = $1', [id]);
+}
+
+async function markPasskeyEnrolled(id: string): Promise<void> {
+  await db.query('UPDATE players SET passkey_enrolled = true WHERE id = $1', [id]);
 }
 
 // ── Passkey credential operations ─────────────────────────────────────────────
@@ -201,9 +213,22 @@ async function consumeChallenge(
 
 // ── JWT + Session ─────────────────────────────────────────────────────────────
 
-function issueJWT(player: Player, sessionId: string): string {
+// Bootstrap JWT — scope: "enroll", 5 minute TTL
+// Proves email ownership. Only valid on passkey enrollment endpoints.
+// Never stored in localStorage — held in memory for ceremony duration only.
+function issueBootstrapJWT(player: Player): string {
   return jwt.sign(
-    { sub: player.id, email: player.email, name: player.name, sessionId, iss: 'swarm-blackjack' },
+    { sub: player.id, email: player.email, name: player.name, scope: 'enroll', iss: 'swarm-blackjack' },
+    JWT_SECRET,
+    { expiresIn: 300 } // 5 minutes
+  );
+}
+
+// Session JWT — scope: "session", 15 minute TTL
+// Issued only after passkey ceremony succeeds. Stored in localStorage.
+function issueSessionJWT(player: Player, sessionId: string): string {
+  return jwt.sign(
+    { sub: player.id, email: player.email, name: player.name, scope: 'session', sessionId, iss: 'swarm-blackjack' },
     JWT_SECRET,
     { expiresIn: JWT_EXPIRES_IN }
   );
@@ -392,30 +417,6 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /login (email fallback — DEV ONLY, remove before feature-complete) ─
-
-  if (method === 'POST' && url.pathname === '/login') {
-    const body = await readBody(req);
-    let data: any;
-    try { data = JSON.parse(body || '{}'); } catch { jsonResponse(res, 400, { error: 'invalid JSON' }); return; }
-
-    const email  = (data.email ?? '').trim().toLowerCase();
-    if (!email) { jsonResponse(res, 400, { error: 'email required' }); return; }
-
-    const player = await findPlayerByEmail(email);
-    if (!player) { jsonResponse(res, 401, { error: 'invalid credentials' }); return; }
-
-    const sessionId = await createSession(player.id);
-    const token     = issueJWT(player, sessionId);
-
-    console.log(`[${SERVICE}] Login (email fallback — dev only): id=${player.id}`);
-    jsonResponse(res, 200, {
-      accessToken: token, expiresIn: JWT_EXPIRES_IN,
-      playerId: player.id, playerName: player.name, email: player.email,
-    });
-    return;
-  }
-
   // ── GET /verify-token ───────────────────────────────────────────────────────
 
   if (method === 'GET' && url.pathname === '/verify-token') {
@@ -455,13 +456,17 @@ const server = http.createServer(async (req, res) => {
     const player = await findPlayerById(playerId);
     if (!player) { jsonResponse(res, 404, { error: 'player not found' }); return; }
 
-    const sessionId = await createSession(player.id);
-    const token     = issueJWT(player, sessionId);
+    // Issue bootstrap JWT — scope: "enroll", 5 minute TTL
+    // Session JWT is NOT issued here. Client must complete passkey enrollment first.
+    const bootstrapToken = issueBootstrapJWT(player);
 
-    console.log(`[${SERVICE}] Exchange: issued JWT for player=${playerId}`);
+    console.log(`[${SERVICE}] Exchange: issued bootstrap JWT for player=${playerId}`);
     jsonResponse(res, 200, {
-      accessToken: token, expiresIn: JWT_EXPIRES_IN,
-      playerId: player.id, playerName: player.name, email: player.email,
+      bootstrapToken,
+      requiresEnrollment: true,
+      playerId:    player.id,
+      playerName:  player.name,
+      email:       player.email,
     });
     return;
   }
@@ -473,6 +478,13 @@ const server = http.createServer(async (req, res) => {
     const token   = getBearerToken(req);
     const payload = token ? verifyJWT(token) : null;
     if (!payload) { jsonResponse(res, 401, { error: 'authentication required' }); return; }
+
+    // Accept enroll scope (first enrollment) or session scope (adding another passkey)
+    const scope = (payload as any).scope;
+    if (scope !== 'enroll' && scope !== 'session') {
+      jsonResponse(res, 403, { error: 'invalid token scope for passkey registration' });
+      return;
+    }
 
     const player = await findPlayerById(payload.sub!);
     if (!player)  { jsonResponse(res, 404, { error: 'player not found' }); return; }
@@ -507,6 +519,12 @@ const server = http.createServer(async (req, res) => {
     const token   = getBearerToken(req);
     const payload = token ? verifyJWT(token) : null;
     if (!payload) { jsonResponse(res, 401, { error: 'authentication required' }); return; }
+
+    const scope = (payload as any).scope;
+    if (scope !== 'enroll' && scope !== 'session') {
+      jsonResponse(res, 403, { error: 'invalid token scope for passkey registration' });
+      return;
+    }
 
     const player = await findPlayerById(payload.sub!);
     if (!player)  { jsonResponse(res, 404, { error: 'player not found' }); return; }
@@ -548,8 +566,25 @@ const server = http.createServer(async (req, res) => {
         transports:   (credential.response as any).transports ?? [],
       });
 
-      console.log(`[${SERVICE}] Passkey enrolled: player=${player.id} credId=${credentialID}`);
-      jsonResponse(res, 200, { verified: true });
+      await markPasskeyEnrolled(player.id);
+      console.log(`[${SERVICE}] Passkey enrolled: player=${player.id} credId=${credentialID} scope=${scope}`);
+
+      // First-time enrollment (bootstrap scope) → issue session JWT now
+      // Adding another passkey (session scope) → just return success
+      if (scope === 'enroll') {
+        const sessionId = await createSession(player.id);
+        const accessToken = issueSessionJWT(player, sessionId);
+        jsonResponse(res, 200, {
+          verified: true,
+          accessToken,
+          expiresIn:  JWT_EXPIRES_IN,
+          playerId:   player.id,
+          playerName: player.name,
+          email:      player.email,
+        });
+      } else {
+        jsonResponse(res, 200, { verified: true });
+      }
     } catch (e: any) {
       console.error(`[${SERVICE}] Passkey registration error:`, e.message);
       jsonResponse(res, 400, { error: e.message });
@@ -631,7 +666,7 @@ const server = http.createServer(async (req, res) => {
       await updateCredentialCounter(storedCred.credentialId, verification.authenticationInfo.newCounter);
 
       const sessionId = await createSession(player.id);
-      const token     = issueJWT(player, sessionId);
+      const token     = issueSessionJWT(player, sessionId);
 
       console.log(`[${SERVICE}] Passkey login success: player=${player.id}`);
       jsonResponse(res, 200, {
@@ -660,6 +695,7 @@ const server = http.createServer(async (req, res) => {
 
     jsonResponse(res, 200, {
       valid: true, playerId: payload.sub, email: payload.email, name: payload.name,
+      scope: (payload as any).scope ?? 'session',
       expiresAt: new Date((payload.exp ?? 0) * 1000).toISOString(),
     });
     return;
@@ -689,6 +725,21 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req);
     const data = JSON.parse(body || '{}');
     jsonResponse(res, 200, { allowed: true, playerId: data.playerId, action: data.action, stub: true });
+    return;
+  }
+
+  // ── POST /dev/reset ─────────────────────────────────────────────────────────
+  // DEV ONLY — wipes all players, credentials, challenges, and Redis sessions.
+  // Gate this off before production.
+
+  if (method === 'POST' && url.pathname === '/dev/reset') {
+    // Truncate in FK-safe order: child tables first, then players
+    await db.query('TRUNCATE TABLE webauthn_challenges RESTART IDENTITY CASCADE');
+    await db.query('TRUNCATE TABLE passkey_credentials RESTART IDENTITY CASCADE');
+    await db.query('TRUNCATE TABLE players RESTART IDENTITY CASCADE');
+    await redis.flushdb();
+    console.log(`[${SERVICE}] DEV RESET: all players, credentials, sessions wiped`);
+    jsonResponse(res, 200, { reset: true, service: SERVICE });
     return;
   }
 
@@ -728,6 +779,11 @@ function errorPage(message: string, uiUrl: string): string {
 
 async function main() {
   await waitForDb();
+
+  // Idempotent migration — safe on every restart
+  await db.query(`ALTER TABLE players ADD COLUMN IF NOT EXISTS passkey_enrolled BOOLEAN NOT NULL DEFAULT false`);
+  console.log(`[${SERVICE}] Migrations complete`);
+
   server.listen(PORT, () => {
     console.log(`[${SERVICE}] listening on :${PORT}`);
     console.log(`[${SERVICE}] WebAuthn: rpId=${RP_ID} origin=${ORIGIN}`);

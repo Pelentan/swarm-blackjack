@@ -3,6 +3,7 @@ import { useGameState } from './hooks/useGameState';
 import { GameTable } from './components/GameTable';
 import { ObservabilityPanel } from './components/ObservabilityPanel';
 import { AuthModal } from './components/AuthModal';
+import { EnrollmentModal } from './components/EnrollmentModal';
 
 const SESSION_KEY = 'swarm_session';
 
@@ -39,10 +40,18 @@ function saveSession(data: {
   return session;
 }
 
+interface EnrollmentPending {
+  bootstrapToken: string;
+  playerId:       string;
+  playerName:     string;
+  email:          string;
+}
+
 function App() {
   const { gameState, connected, error, sendAction } = useGameState();
-  const [session, setSession]     = useState<Session | null>(loadSession);
-  const [showModal, setShowModal] = useState(false);
+  const [session, setSession]               = useState<Session | null>(loadSession);
+  const [showModal, setShowModal]           = useState(false);
+  const [enrollment, setEnrollment]         = useState<EnrollmentPending | null>(null);
 
   // Handle email verification redirect: /?exchange={code}
   useEffect(() => {
@@ -57,7 +66,20 @@ function App() {
       body:    JSON.stringify({ code }),
     })
       .then(r => r.json())
-      .then((data: any) => { if (data.accessToken) setSession(saveSession(data)); })
+      .then((data: any) => {
+        if (data.requiresEnrollment && data.bootstrapToken) {
+          // Bootstrap token — hold in memory, show mandatory enrollment modal
+          setEnrollment({
+            bootstrapToken: data.bootstrapToken,
+            playerId:       data.playerId,
+            playerName:     data.playerName,
+            email:          data.email,
+          });
+        } else if (data.accessToken) {
+          // Legacy path (shouldn't happen with current server, but safe fallback)
+          setSession(saveSession(data));
+        }
+      })
       .catch(e => console.error('[auth] exchange failed:', e));
   }, []);
 
@@ -68,6 +90,26 @@ function App() {
     const t = setTimeout(() => setSession(null), ms);
     return () => clearTimeout(t);
   }, [session]);
+
+  const handleDevReset = async () => {
+    if (!window.confirm('DEV RESET: wipe all players, sessions, and balances?')) return;
+    try {
+      const res = await fetch('/dev/reset', { method: 'POST' });
+      const data = await res.json();
+      console.log('[dev] reset result:', data);
+      localStorage.removeItem(SESSION_KEY);
+      setSession(null);
+      setEnrollment(null);
+      const resultLines = Object.entries(data.results ?? {})
+        .map(([svc, status]) => `  ${svc}: ${status}`)
+        .join('\n');
+      alert(`Reset complete:\n${resultLines}`);
+    } catch (e) {
+      console.error('[dev] reset failed:', e);
+      alert('Reset failed — check console');
+    }
+  };
+
 
   const handleAuthSuccess = (result: {
     accessToken: string; expiresIn: number;
@@ -111,6 +153,15 @@ function App() {
               {connected ? 'Connected via SSE' : 'Connecting...'}
             </span>
           </div>
+
+          {/* DEV ONLY */}
+          <button onClick={handleDevReset} title="DEV: wipe all accounts" style={{
+            padding: '5px 10px', background: 'none',
+            border: '1px solid #4a1515', borderRadius: 6,
+            color: '#6b2929', fontSize: '0.68rem', cursor: 'pointer',
+          }}>
+            ⚠ Reset DB
+          </button>
 
           {session ? (
             <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -199,6 +250,19 @@ function App() {
 
       {showModal && (
         <AuthModal onSuccess={handleAuthSuccess} onClose={() => setShowModal(false)} />
+      )}
+
+      {enrollment && (
+        <EnrollmentModal
+          bootstrapToken={enrollment.bootstrapToken}
+          playerId={enrollment.playerId}
+          playerName={enrollment.playerName}
+          email={enrollment.email}
+          onSuccess={(result) => {
+            setEnrollment(null);
+            setSession(saveSession(result));
+          }}
+        />
       )}
     </div>
   );

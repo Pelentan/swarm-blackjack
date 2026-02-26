@@ -139,11 +139,6 @@ func forwardToAuth(action string, fields map[string]string) (*AuthResult, int, s
 			"email": strings.TrimSpace(strings.ToLower(fields["email"])),
 			"name":  strings.TrimSpace(fields["name"]),
 		}
-	case "login":
-		endpoint = "/login"
-		payload = map[string]string{
-			"email": strings.TrimSpace(strings.ToLower(fields["email"])),
-		}
 	default:
 		return nil, 400, "unknown action"
 	}
@@ -281,7 +276,10 @@ func submitHandler(w http.ResponseWriter, r *http.Request) {
 	case "register":
 		validationErrs = validateRegister(req.Fields)
 	case "login":
-		validationErrs = validateLogin(req.Fields)
+		// Login is passkey-only — submit should not be called for login
+		// (UI uses passkey ceremony directly). Return 400 to surface misconfiguration.
+		writeJSON(w, 400, map[string]string{"error": "login requires passkey ceremony — use /passkey/login/begin"})
+		return
 	default:
 		writeJSON(w, 400, map[string]string{"error": "action must be 'register' or 'login'"})
 		return

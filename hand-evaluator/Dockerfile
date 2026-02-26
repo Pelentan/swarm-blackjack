@@ -8,7 +8,7 @@ RUN cabal build && \
 
 FROM debian:bookworm-slim
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends libgmp10 locales && \
+    apt-get install -y --no-install-recommends libgmp10 locales wget && \
     rm -rf /var/lib/apt/lists/* && \
     echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen && \
     locale-gen
