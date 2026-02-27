@@ -3,7 +3,7 @@ import { Card as CardType } from '../types';
 
 interface CardProps {
   card: CardType;
-  size?: 'sm' | 'md' | 'lg';
+  size?: 'xs' | 'sm' | 'md' | 'lg';
 }
 
 const SUIT_SYMBOLS: Record<string, string> = {
@@ -28,6 +28,7 @@ export const CardComponent: React.FC<CardProps> = ({ card, size = 'md' }) => {
   const color = SUIT_COLORS[card.suit] || '#4a5568';
 
   const sizes = {
+    xs: { width: 30, height: 42, rankSize: 0.55, suitSize: '0.7rem' },
     sm: { width: 48, height: 68, rankSize: 0.75, suitSize: '1.2rem' },
     md: { width: 64, height: 90, rankSize: 1, suitSize: '1.6rem' },
     lg: { width: 80, height: 112, rankSize: 1.2, suitSize: '2rem' },

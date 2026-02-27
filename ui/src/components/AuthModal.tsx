@@ -93,7 +93,7 @@ export const AuthModal: React.FC<Props> = ({ onSuccess, onClose }) => {
       const options = await beginRes.json();
 
       // 2. Invoke browser ceremony — shows native passkey UI
-      const assertion = await startAuthentication(options);
+      const assertion = await startAuthentication({ optionsJSON: options });
 
       // 3. Send assertion to server for verification
       const completeRes = await fetch(`${AUTH_UI}/passkey/login/complete`, {

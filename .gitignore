@@ -4,6 +4,8 @@
 !.env.example
 auth.env
 !auth.env.example
+bank.env
+!bank.env.example
 
 # Key material and certificates — all formats
 *.key

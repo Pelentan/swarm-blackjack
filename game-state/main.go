@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -29,6 +30,7 @@ type PlayerState struct {
 	IsSoftHand  bool   `json:"isSoftHand"`
 	Status      string `json:"status"`
 	BankTxID    string `json:"-"` // internal only — never sent to frontend
+	BankTxID2   string `json:"-"` // double-down additional bet transaction
 }
 
 type DealerState struct {
@@ -66,6 +68,7 @@ type Table struct {
 	mu        sync.RWMutex
 	state     GameState
 	clients   map[chan GameState]struct{}
+	isDemo    bool
 	phase     int // cycling demo phases
 }
 
@@ -87,6 +90,7 @@ func NewTable(tableID string) *Table {
 	}
 
 	return &Table{
+		isDemo:  true,
 		clients: make(map[chan GameState]struct{}),
 		state: GameState{
 			TableID: tableID,
@@ -104,6 +108,31 @@ func NewTable(tableID string) *Table {
 				Hand:       []Card{},
 				IsRevealed: false,
 			},
+			MinBet:    10,
+			MaxBet:    500,
+			HandledBy: hostname(),
+			Timestamp: now(),
+		},
+	}
+}
+
+// NewPlayerTable creates an event-driven table for a real authenticated player.
+// Bank calls are made BEFORE this is called — do not hold the registry lock here.
+func NewPlayerTable(tableID, playerID, playerName string, startingChips int) *Table {
+	return &Table{
+		isDemo:  false,
+		clients: make(map[chan GameState]struct{}),
+		state: GameState{
+			TableID: tableID,
+			Phase:   "waiting",
+			Players: []PlayerState{{
+				ID:     playerID,
+				Name:   playerName,
+				Chips:  startingChips,
+				Hand:   []Card{},
+				Status: "waiting",
+			}},
+			Dealer:    DealerState{Hand: []Card{}, IsRevealed: false},
 			MinBet:    10,
 			MaxBet:    500,
 			HandledBy: hostname(),
@@ -175,6 +204,12 @@ func (r *Registry) GetOrCreate(id string) *Table {
 	if t, ok := r.tables[id]; ok {
 		return t
 	}
+	// Never auto-create player tables via GetOrCreate — they must be explicitly
+	// created via CreatePlayerTable so the correct player ID and balance are set.
+	// Return nil for player-table-* IDs that don't exist yet.
+	if len(id) > 13 && id[:13] == "player-table-" {
+		return nil
+	}
 	t := NewTable(id)
 	r.tables[id] = t
 	return t
@@ -190,10 +225,61 @@ func (r *Registry) List() []GameState {
 	return states
 }
 
+// CreatePlayerTable creates or refreshes a player-owned table.
+// Bank HTTP calls happen outside the registry lock to avoid blocking SSE connections.
+func (r *Registry) CreatePlayerTable(playerID, playerName string) *Table {
+	tableID := "player-table-" + playerID
+
+	// Check if table already exists (read lock only)
+	r.mu.RLock()
+	existing, ok := r.tables[tableID]
+	r.mu.RUnlock()
+
+	if ok {
+		// Refresh balance outside any lock
+		if balance := callBankBalance(playerID); balance >= 0 {
+			existing.mu.Lock()
+			if len(existing.state.Players) > 0 {
+				existing.state.Players[0].Chips = balance
+				existing.state.Players[0].Name  = playerName
+			}
+			existing.mu.Unlock()
+		}
+		return existing
+	}
+
+	// New table — do bank calls before taking the registry lock
+	http.Post(bankServiceURL+"/account",
+		"application/json",
+		bytes.NewReader([]byte(fmt.Sprintf(
+			`{"playerId":"%s","startingBalance":"1000.00"}`, playerID,
+		))),
+	)
+	startingChips := 1000
+	if balance := callBankBalance(playerID); balance >= 0 {
+		startingChips = balance
+	}
+
+	t := NewPlayerTable(tableID, playerID, playerName, startingChips)
+
+	// Now take the write lock just to insert
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	// Double-check in case of concurrent creation
+	if existing, ok := r.tables[tableID]; ok {
+		return existing
+	}
+	r.tables[tableID] = t
+	return t
+}
+
 // ── Demo Game Loop ─────────────────────────────────────────────────────────────
 // Cycles the default table through realistic game phases so the UI has
 // something to render without real players. Calls stub services so the
 // observability dashboard shows real inter-service traffic.
+
+// demoPaused controls whether the demo loop runs. Toggle via POST /demo/pause.
+var demoPaused int32 // atomic: 0=running, 1=paused
 
 func runDemoLoop(table *Table) {
 	phases := []func(*Table){
@@ -205,6 +291,10 @@ func runDemoLoop(table *Table) {
 	}
 	for {
 		for _, phase := range phases {
+			// Check pause between phases
+			for atomic.LoadInt32(&demoPaused) == 1 {
+				time.Sleep(500 * time.Millisecond)
+			}
 			phase(table)
 		}
 	}
@@ -403,9 +493,19 @@ func phasePayout(t *Table) {
 	dealerVal := s.Dealer.HandValue
 
 	var outcome string
+	// Natural blackjack: exactly 2 cards totalling 21 (dealer did not also have blackjack)
+	playerBlackjack := playerVal == 21 && len(s.Players[0].Hand) == 2
+	dealerBlackjack  := dealerVal == 21 && len(s.Dealer.Hand) == 2
 	if s.Players[0].Status == "bust" {
 		s.Players[0].Status = "lost"
 		outcome = "loss"
+	} else if playerBlackjack && dealerBlackjack {
+		// Both have natural — push, no 3:2 bonus
+		s.Players[0].Status = "push"
+		outcome = "push"
+	} else if playerBlackjack {
+		s.Players[0].Status = "blackjack"
+		outcome = "blackjack"
 	} else if dealerVal > 21 || playerVal > dealerVal {
 		s.Players[0].Status = "won"
 		outcome = "win"
@@ -450,6 +550,381 @@ func phasePayout(t *Table) {
 	t.SetState(s)
 
 	time.Sleep(800 * time.Millisecond)
+}
+
+// ── Player State Machine ─────────────────────────────────────────────────────
+// All functions run in a goroutine — they may sleep for visual pacing.
+// Table.SetState broadcasts each update to connected SSE clients.
+
+func processPlayerAction(table *Table, action PlayerActionRequest) {
+	s := table.GetState()
+	// Use the table's actual player ID — guards against session/table ID mismatch
+	if len(s.Players) > 0 {
+		action.PlayerID = s.Players[0].ID
+	}
+	switch s.Phase {
+	case "waiting":
+		if action.Action == "bet" {
+			playerBet(table, action)
+		}
+	case "player_turn":
+		switch action.Action {
+		case "hit":
+			playerHit(table)
+		case "stand":
+			playerStand(table)
+		case "double":
+			playerDouble(table)
+		case "split":
+			// Stubbed — acknowledge but do nothing
+			log.Println("[game-state] split: stubbed, action ignored")
+		}
+	}
+}
+
+func playerBet(table *Table, action PlayerActionRequest) {
+	s := table.GetState()
+	if len(s.Players) == 0 {
+		return
+	}
+	amount := action.Amount
+	if amount < s.MinBet {
+		amount = s.MinBet
+	}
+	if amount > s.MaxBet {
+		amount = s.MaxBet
+	}
+	if amount > s.Players[0].Chips {
+		amount = s.Players[0].Chips
+	}
+	if amount <= 0 {
+		return
+	}
+
+	txID, newBalance := callBankBet(s.Players[0].ID, amount)
+	if txID == "" {
+		log.Printf("[game-state] bet rejected by bank for player=%s", s.Players[0].ID)
+		return
+	}
+
+	s.Players[0].BankTxID = txID
+	s.Players[0].CurrentBet = amount
+	s.Players[0].Chips = newBalance
+	s.Players[0].Status = "betting"
+	s.Players[0].Hand = []Card{}
+	s.Players[0].HandValue = 0
+	s.Dealer = DealerState{Hand: []Card{}, IsRevealed: false}
+	s.Phase = "betting"
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(500 * time.Millisecond)
+
+	// Initialize shoe for this table (idempotent — 409 if already exists is fine)
+	initShoe(s.TableID)
+
+	// Deal 4 cards: p1, dealer-up, p2, dealer-hole
+	cards := callDeckService(s.TableID, 4)
+	if len(cards) < 4 {
+		cards = defaultCards()
+	}
+
+	s = table.GetState()
+	s.Phase = "dealing"
+	table.SetState(s)
+	time.Sleep(300 * time.Millisecond)
+
+	// Player card 1
+	s = table.GetState()
+	s.Players[0].Hand = []Card{cards[0]}
+	hr := callHandEvaluator(s.Players[0].Hand)
+	s.Players[0].HandValue = hr.Value
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(500 * time.Millisecond)
+
+	// Dealer face-up
+	s = table.GetState()
+	s.Dealer.Hand = []Card{cards[1]}
+	s.Dealer.HandValue = cardValue(cards[1])
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(500 * time.Millisecond)
+
+	// Player card 2
+	s = table.GetState()
+	s.Players[0].Hand = append(s.Players[0].Hand, cards[2])
+	hr = callHandEvaluator(s.Players[0].Hand)
+	s.Players[0].HandValue = hr.Value
+	s.Players[0].IsSoftHand = hr.IsSoft
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(500 * time.Millisecond)
+
+	// Dealer hole card (hidden)
+	s = table.GetState()
+	s.Dealer.Hand = append(s.Dealer.Hand, Card{Suit: "hidden", Rank: "hidden"})
+	pid := s.Players[0].ID
+	s.ActivePlayerID = &pid
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(600 * time.Millisecond)
+
+	// Natural blackjack check
+	if hr.Value == 21 {
+		s = table.GetState()
+		s.Players[0].Status = "blackjack"
+		s.Phase = "player_turn"
+		s.HandledBy = hostname()
+		s.Timestamp = now()
+		table.SetState(s)
+		time.Sleep(1000 * time.Millisecond)
+		runDealerTurnPlayer(table)
+		return
+	}
+
+	s = table.GetState()
+	s.Phase = "player_turn"
+	s.Players[0].Status = "playing"
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+}
+
+func playerHit(table *Table) {
+	s := table.GetState()
+	if len(s.Players) == 0 || s.Players[0].Status != "playing" {
+		return
+	}
+	cards := callDeckService(s.TableID, 1)
+	if len(cards) > 0 {
+		s.Players[0].Hand = append(s.Players[0].Hand, cards[0])
+	} else {
+		s.Players[0].Hand = append(s.Players[0].Hand, Card{Suit: "hearts", Rank: "7"})
+	}
+	hr := callHandEvaluator(s.Players[0].Hand)
+	s.Players[0].HandValue = hr.Value
+	s.Players[0].IsSoftHand = hr.IsSoft
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	if hr.IsBust {
+		s.Players[0].Status = "bust"
+		s.ActivePlayerID = nil
+		table.SetState(s)
+		time.Sleep(800 * time.Millisecond)
+		runDealerTurnPlayer(table)
+		return
+	}
+	if hr.Value == 21 {
+		s.Players[0].Status = "standing"
+		s.ActivePlayerID = nil
+		table.SetState(s)
+		time.Sleep(600 * time.Millisecond)
+		runDealerTurnPlayer(table)
+		return
+	}
+	table.SetState(s)
+}
+
+func playerStand(table *Table) {
+	s := table.GetState()
+	if len(s.Players) == 0 {
+		return
+	}
+	s.Players[0].Status = "standing"
+	s.ActivePlayerID = nil
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(400 * time.Millisecond)
+	runDealerTurnPlayer(table)
+}
+
+func playerDouble(table *Table) {
+	s := table.GetState()
+	if len(s.Players) == 0 || s.Players[0].Status != "playing" {
+		return
+	}
+	additionalBet := s.Players[0].CurrentBet
+	if additionalBet > s.Players[0].Chips {
+		// Can't afford full double — fall back to hit
+		playerHit(table)
+		return
+	}
+	txID2, newBalance := callBankBet(s.Players[0].ID, additionalBet)
+	if txID2 == "" {
+		playerHit(table)
+		return
+	}
+	s = table.GetState()
+	s.Players[0].CurrentBet += additionalBet
+	s.Players[0].Chips = newBalance
+	s.Players[0].BankTxID2 = txID2
+
+	// One card, forced stand
+	cards := callDeckService(s.TableID, 1)
+	if len(cards) > 0 {
+		s.Players[0].Hand = append(s.Players[0].Hand, cards[0])
+	} else {
+		s.Players[0].Hand = append(s.Players[0].Hand, Card{Suit: "diamonds", Rank: "4"})
+	}
+	hr := callHandEvaluator(s.Players[0].Hand)
+	s.Players[0].HandValue = hr.Value
+	s.Players[0].IsSoftHand = hr.IsSoft
+	if hr.IsBust {
+		s.Players[0].Status = "bust"
+	} else {
+		s.Players[0].Status = "standing"
+	}
+	s.ActivePlayerID = nil
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(600 * time.Millisecond)
+	runDealerTurnPlayer(table)
+}
+
+func runDealerTurnPlayer(table *Table) {
+	s := table.GetState()
+	s.Phase = "dealer_turn"
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(600 * time.Millisecond)
+
+	// Reveal hole card — draw from shoe
+	s = table.GetState()
+	if len(s.Dealer.Hand) >= 2 {
+		realCards := callDeckService(s.TableID, 1)
+		if len(realCards) > 0 {
+			s.Dealer.Hand[1] = realCards[0]
+		} else {
+			s.Dealer.Hand[1] = Card{Suit: "clubs", Rank: "8"}
+		}
+	}
+	s.Dealer.IsRevealed = true
+	hr := callHandEvaluator(s.Dealer.Hand)
+	s.Dealer.HandValue = hr.Value
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(800 * time.Millisecond)
+
+	// If player busted, no need to play dealer hand
+	s = table.GetState()
+	playerBust := len(s.Players) > 0 && s.Players[0].Status == "bust"
+
+	if !playerBust {
+		for s.Dealer.HandValue < 17 {
+			callDealerAI(s.Dealer.Hand)
+			hitCards := callDeckService(s.TableID, 1)
+			s = table.GetState()
+			if len(hitCards) > 0 {
+				s.Dealer.Hand = append(s.Dealer.Hand, hitCards[0])
+			} else {
+				s.Dealer.Hand = append(s.Dealer.Hand, Card{Suit: "spades", Rank: "3"})
+			}
+			hr = callHandEvaluator(s.Dealer.Hand)
+			s.Dealer.HandValue = hr.Value
+			s.HandledBy = hostname()
+			s.Timestamp = now()
+			table.SetState(s)
+			time.Sleep(700 * time.Millisecond)
+		}
+	}
+
+	runPayoutPlayer(table)
+}
+
+func runPayoutPlayer(table *Table) {
+	s := table.GetState()
+	s.Phase = "payout"
+
+	if len(s.Players) == 0 {
+		table.SetState(s)
+		return
+	}
+
+	playerVal := s.Players[0].HandValue
+	dealerVal := s.Dealer.HandValue
+	playerStatus := s.Players[0].Status
+
+	playerBlackjack := playerVal == 21 && len(s.Players[0].Hand) == 2 && playerStatus == "blackjack"
+	dealerBlackjack := dealerVal == 21 && len(s.Dealer.Hand) == 2
+
+	var outcome string
+	switch {
+	case playerStatus == "bust":
+		s.Players[0].Status = "lost"
+		outcome = "loss"
+	case playerBlackjack && dealerBlackjack:
+		s.Players[0].Status = "push"
+		outcome = "push"
+	case playerBlackjack:
+		s.Players[0].Status = "blackjack"
+		outcome = "blackjack"
+	case dealerVal > 21 || playerVal > dealerVal:
+		s.Players[0].Status = "won"
+		outcome = "win"
+	case playerVal == dealerVal:
+		s.Players[0].Status = "push"
+		outcome = "push"
+	default:
+		s.Players[0].Status = "lost"
+		outcome = "loss"
+	}
+
+	// Settle primary bet
+	if txID := s.Players[0].BankTxID; txID != "" {
+		if newBalance := callBankPayout(txID, outcome); newBalance >= 0 {
+			s.Players[0].Chips = newBalance
+		}
+		s.Players[0].BankTxID = ""
+	}
+	// Settle double-down additional bet
+	if txID2 := s.Players[0].BankTxID2; txID2 != "" {
+		if newBalance := callBankPayout(txID2, outcome); newBalance >= 0 {
+			s.Players[0].Chips = newBalance
+		}
+		s.Players[0].BankTxID2 = ""
+	}
+
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+	time.Sleep(2500 * time.Millisecond)
+
+	// Reset to waiting for next hand
+	s = table.GetState()
+	s.Phase = "waiting"
+	s.Players[0].Status = "waiting"
+	s.Players[0].CurrentBet = 0
+	s.Players[0].Hand = []Card{}
+	s.Players[0].HandValue = 0
+	s.Players[0].IsSoftHand = false
+	s.Dealer = DealerState{Hand: []Card{}, IsRevealed: false}
+	s.ActivePlayerID = nil
+	s.HandledBy = hostname()
+	s.Timestamp = now()
+	table.SetState(s)
+}
+
+func initShoe(tableID string) {
+	body, _ := json.Marshal(map[string]interface{}{
+		"tableId":   tableID,
+		"deckCount": 6,
+	})
+	resp, err := http.Post(deckServiceURL+"/shoe", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[deck-service] initShoe error: %v", err)
+		return
+	}
+	resp.Body.Close()
+	// 409 = shoe already exists, that's fine
 }
 
 // ── Upstream Service Calls ─────────────────────────────────────────────────────
@@ -559,12 +1034,12 @@ func callDealerAI(hand []Card) string {
 // ── Bank Service Calls ────────────────────────────────────────────────────────
 
 type BetResponse struct {
-	TransactionID string  `json:"transactionId"`
-	NewBalance    float64 `json:"newBalance"`
+	TransactionID string `json:"transactionId"`
+	NewBalance    string `json:"newBalance"` // bank returns string e.g. "975.00"
 }
 
 type PayoutResponse struct {
-	NewBalance float64 `json:"newBalance"`
+	NewBalance string `json:"newBalance"` // bank returns string e.g. "975.00"
 }
 
 // callBankBet deducts the bet from the player's bank balance.
@@ -591,7 +1066,9 @@ func callBankBet(playerID string, amount int) (string, int) {
 
 	var result BetResponse
 	json.NewDecoder(resp.Body).Decode(&result)
-	return result.TransactionID, int(result.NewBalance)
+	var bal float64
+	fmt.Sscanf(result.NewBalance, "%f", &bal)
+	return result.TransactionID, int(bal)
 }
 
 // callBankPayout settles a bet transaction.
@@ -619,7 +1096,9 @@ func callBankPayout(txID string, result string) int {
 
 	var pr PayoutResponse
 	json.NewDecoder(resp.Body).Decode(&pr)
-	return int(pr.NewBalance)
+	var bal float64
+	fmt.Sscanf(pr.NewBalance, "%f", &bal)
+	return int(bal)
 }
 
 // callBankBalance fetches current balance for display on startup/reconnect.
@@ -666,6 +1145,39 @@ func main() {
 		json.NewEncoder(w).Encode(registry.List())
 	})
 
+	// POST /tables/create — create a player-owned table
+	// Reached via gateway rewrite: /api/game/create → /tables/create
+	mux.HandleFunc("/tables/create", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			PlayerID   string `json:"playerId"`
+			PlayerName string `json:"playerName"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.PlayerID == "" {
+			http.Error(w, `{"error":"playerId required"}`, http.StatusBadRequest)
+			return
+		}
+		if req.PlayerName == "" {
+			req.PlayerName = "Player"
+		}
+		table := registry.CreatePlayerTable(req.PlayerID, req.PlayerName)
+		s := table.GetState()
+		w.WriteHeader(http.StatusCreated)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"tableId":  s.TableID,
+			"phase":    s.Phase,
+			"playerId": req.PlayerID,
+		})
+	})
+
 	// GET /tables/{id} - state snapshot
 	// GET /tables/{id}/stream - SSE
 	// POST /tables/{id}/action - player action
@@ -710,6 +1222,25 @@ func main() {
 		json.NewEncoder(w).Encode(table.GetState())
 	})
 
+	// POST /demo/pause — toggle demo loop on/off
+	mux.HandleFunc("/demo/pause", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if atomic.LoadInt32(&demoPaused) == 0 {
+			atomic.StoreInt32(&demoPaused, 1)
+			log.Println("[demo] paused")
+		} else {
+			atomic.StoreInt32(&demoPaused, 0)
+			log.Println("[demo] resumed")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"paused": atomic.LoadInt32(&demoPaused) == 1,
+		})
+	})
+
 	port := getEnv("PORT", "3001")
 	log.Printf("🃏 Game State service starting on :%s", port)
 	log.Printf("   Demo table: %s", demoTableID)
@@ -732,6 +1263,10 @@ func sseHandler(w http.ResponseWriter, r *http.Request, registry *Registry, tabl
 	}
 
 	table := registry.GetOrCreate(tableID)
+	if table == nil {
+		http.Error(w, "table not found", http.StatusNotFound)
+		return
+	}
 	ch := table.Subscribe()
 	defer table.Unsubscribe(ch)
 
@@ -770,22 +1305,49 @@ func actionHandler(w http.ResponseWriter, r *http.Request, registry *Registry, t
 		return
 	}
 
-	_, ok := registry.Get(tableID)
+	table, ok := registry.Get(tableID)
 	if !ok {
 		http.NotFound(w, r)
 		return
 	}
 
-	// TODO: validate action against game phase and player state
-	// For now: accept all actions
-	log.Printf("[game-state] action: player=%s action=%s", action.PlayerID, action.Action)
+	// Demo table: acknowledge but do not process
+	if table.isDemo {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"accepted": true,
+			"message":  "demo table — actions are simulated",
+		})
+		return
+	}
 
+	// Validate action is legal for current phase
+	s := table.GetState()
+	valid := false
+	switch s.Phase {
+	case "waiting":
+		valid = action.Action == "bet"
+	case "player_turn":
+		valid = action.Action == "hit" || action.Action == "stand" ||
+			action.Action == "double" || action.Action == "split"
+	}
+	if !valid {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"accepted": false,
+			"message":  fmt.Sprintf("action '%s' not valid in phase '%s'", action.Action, s.Phase),
+		})
+		return
+	}
+
+	// Respond 202 immediately, process async
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"accepted": true,
-		"message":  fmt.Sprintf("action '%s' accepted", action.Action),
-	})
+	json.NewEncoder(w).Encode(map[string]interface{}{"accepted": true, "message": "processing"})
+
+	go processPlayerAction(table, action)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

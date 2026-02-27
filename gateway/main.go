@@ -70,8 +70,50 @@ func (b *ObservabilityBus) Publish(evt ObservabilityEvent) {
 	}
 }
 
+// BalanceBus fans out balance updates to subscribed SSE clients
+type BalanceBus struct {
+	mu      sync.RWMutex
+	clients map[chan BalanceEvent]struct{}
+}
+
+type BalanceEvent struct {
+	PlayerID string  `json:"playerId"`
+	Balance  float64 `json:"balance"`
+}
+
+func NewBalanceBus() *BalanceBus {
+	return &BalanceBus{clients: make(map[chan BalanceEvent]struct{})}
+}
+
+func (b *BalanceBus) Subscribe() chan BalanceEvent {
+	ch := make(chan BalanceEvent, 8)
+	b.mu.Lock()
+	b.clients[ch] = struct{}{}
+	b.mu.Unlock()
+	return ch
+}
+
+func (b *BalanceBus) Unsubscribe(ch chan BalanceEvent) {
+	b.mu.Lock()
+	delete(b.clients, ch)
+	b.mu.Unlock()
+	close(ch)
+}
+
+func (b *BalanceBus) Publish(evt BalanceEvent) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	for ch := range b.clients {
+		select {
+		case ch <- evt:
+		default:
+		}
+	}
+}
+
 var (
-	bus = NewObservabilityBus()
+	bus        = NewObservabilityBus()
+	balanceBus = NewBalanceBus()
 
 	serviceURLs = map[string]string{
 		"game-state": getEnv("GAME_STATE_URL", "http://game-state:3001"),
@@ -80,6 +122,7 @@ var (
 		"bank":       getEnv("BANK_URL", "http://bank-service:3005"),
 		"chat":       getEnv("CHAT_URL", "http://chat-service:3007"),
 		"email":      getEnv("EMAIL_URL", "http://email-service:3008"),
+		"document":   getEnv("DOCUMENT_URL", "http://document-service:3011"),
 		"ui":         getEnv("UI_URL", "http://ui:3000"),
 	}
 )
@@ -100,6 +143,9 @@ func main() {
 	// Observability SSE feed (no auth — dashboard is internal)
 	mux.HandleFunc("/events", observabilitySSEHandler)
 
+	// Demo control — pause/resume the demo loop
+	mux.HandleFunc("/api/game/demo/pause", instrumentedProxyWithRewrite("game-state", serviceURLs["game-state"], "/api/game/demo/", "/demo/"))
+
 	// Game routes — SSE stream and table listing are public (EventSource can't send headers)
 	// Actions are open for now — will require session scope once player join flow is wired
 	mux.HandleFunc("/api/game/", instrumentedProxyWithRewrite("game-state", serviceURLs["game-state"], "/api/game/", "/tables/"))
@@ -119,6 +165,7 @@ func main() {
 	mux.HandleFunc("/api/auth-ui/", instrumentedProxyWithRewrite("auth-ui", serviceURLs["auth-ui"], "/api/auth-ui/", "/"))
 
 	// Bank routes → bank service (/api/bank/* → /*) — session scope required
+	mux.HandleFunc("/api/bank/export", requireSessionScope(instrumentedProxyWithRewrite("bank", serviceURLs["bank"], "/api/bank/export", "/export")))
 	mux.HandleFunc("/api/bank/", requireSessionScope(instrumentedProxyWithRewrite("bank", serviceURLs["bank"], "/api/bank/", "/")))
 
 	// Chat routes → chat service (/api/chat/* → /*)
@@ -129,6 +176,8 @@ func main() {
 
 	// DEV ONLY — wipe all state and re-seed
 	mux.HandleFunc("/dev/reset", devResetHandler)
+	mux.HandleFunc("/dev/demo-token", instrumentedProxyWithRewrite("auth", serviceURLs["auth"], "/dev/demo-token", "/dev/demo-token"))
+	mux.HandleFunc("/api/bank/balance/stream", balanceSSEHandler)
 
 	// UI catch-all — must be last. Proxies everything else to the UI container.
 	// In production this would be a CDN or static file server.
@@ -139,6 +188,27 @@ func main() {
 
 	// Subscribe to Redis for internal service events
 	go subscribeRedis()
+	go func() {
+		// Reuse the same Redis connection strategy — wait for redis to be ready
+		redisAddr := getEnv("REDIS_URL", "redis:6379")
+		var rdb *redis.Client
+		for i := 0; i < 10; i++ {
+			rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			err := rdb.Ping(ctx).Err()
+			cancel()
+			if err == nil {
+				break
+			}
+			rdb.Close()
+			rdb = nil
+			time.Sleep(2 * time.Second)
+		}
+		if rdb != nil {
+			defer rdb.Close()
+			subscribeRedisBalance(rdb)
+		}
+	}()
 
 	if err := http.ListenAndServe(":"+port, corsMiddleware(mux)); err != nil {
 		log.Fatal(err)
@@ -153,6 +223,7 @@ func instrumentedProxyWithRewrite(callee, targetURL, stripPrefix, addPrefix stri
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.FlushInterval = -1 // flush immediately — required for SSE pass-through
 	proxy.Director = func(req *http.Request) {
 		req.URL.Scheme = target.Scheme
 		req.URL.Host = target.Host
@@ -204,6 +275,7 @@ func instrumentedProxy(callee, targetURL string) http.HandlerFunc {
 	}
 
 	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.FlushInterval = -1 // flush immediately — required for SSE pass-through
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 		log.Printf("proxy error [%s]: %v", callee, err)
 		w.Header().Set("Content-Type", "application/json")
@@ -373,6 +445,52 @@ func observabilitySSEHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// balanceSSEHandler streams balance updates to the UI.
+// No auth — demo player is public; production would scope per JWT.
+func balanceSSEHandler(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "SSE not supported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	ch := balanceBus.Subscribe()
+	defer balanceBus.Unsubscribe(ch)
+
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				return
+			}
+			data, _ := json.Marshal(evt)
+			fmt.Fprintf(w, "event: balance_update\ndata: %s\n\n", data)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// subscribeRedisBalance subscribes to swarm:balance and fans out to balanceBus.
+func subscribeRedisBalance(rdb *redis.Client) {
+	sub := rdb.Subscribe(context.Background(), "swarm:balance")
+	defer sub.Close()
+	log.Printf("[gateway] subscribed to Redis channel swarm:balance")
+	for msg := range sub.Channel() {
+		var evt BalanceEvent
+		if err := json.Unmarshal([]byte(msg.Payload), &evt); err != nil {
+			log.Printf("[gateway] balance event parse error: %v", err)
+			continue
+		}
+		balanceBus.Publish(evt)
+	}
+}
+
 // subscribeRedis subscribes to the observability Redis channel and feeds
 // events into the local bus so SSE clients see internal service calls.
 func subscribeRedis() {
@@ -501,4 +619,12 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(status int) {
 	r.status = status
 	r.ResponseWriter.WriteHeader(status)
+}
+
+// Flush implements http.Flusher — required for SSE pass-through via reverse proxy.
+// Without this, FlushInterval: -1 on the proxy has no effect.
+func (r *statusRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
 }

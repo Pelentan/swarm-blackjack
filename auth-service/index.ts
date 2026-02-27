@@ -728,6 +728,29 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // ── GET /dev/demo-token ──────────────────────────────────────────────────────
+  // Issues a long-lived session JWT for the demo player.
+  // No auth required — demo player is public by design.
+  // Gate this off before production.
+
+  if (method === 'GET' && url.pathname === '/dev/demo-token') {
+    const DEMO_PLAYER_ID = 'player-00000000-0000-0000-0000-000000000001';
+    const token = jwt.sign(
+      {
+        sub:       DEMO_PLAYER_ID,
+        email:     'demo@swarm-blackjack.local',
+        name:      'Player 1',
+        scope:     'session',
+        sessionId: 'demo-session',
+        iss:       'swarm-blackjack',
+      },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    jsonResponse(res, 200, { accessToken: token, playerId: DEMO_PLAYER_ID });
+    return;
+  }
+
   // ── POST /dev/reset ─────────────────────────────────────────────────────────
   // DEV ONLY — wipes all players, credentials, challenges, and Redis sessions.
   // Gate this off before production.

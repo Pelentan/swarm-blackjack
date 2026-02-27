@@ -51,7 +51,7 @@ export const EnrollmentModal: React.FC<Props> = ({
       const options = await beginRes.json();
 
       // 2. Browser ceremony — OS handles biometric/PIN prompt
-      const credential = await startRegistration(options);
+      const credential = await startRegistration({ optionsJSON: options });
 
       // 3. Complete — verify attestation, issues session JWT
       const completeRes = await fetch(`${AUTH_UI}/passkey/register/complete`, {

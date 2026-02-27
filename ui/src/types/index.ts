@@ -52,6 +52,14 @@ export interface SSEGameEvent {
 
 export type PlayerAction = 'bet' | 'hit' | 'stand' | 'double' | 'split' | 'insurance';
 
+// Captured at phase=complete for session history drawer
+export interface RoundSnapshot {
+  id: string;           // timestamp-based unique id
+  timestamp: string;
+  players: PlayerState[];
+  dealer: DealerState;
+}
+
 export interface ObservabilityEvent {
   id: string;
   timestamp: string;

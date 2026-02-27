@@ -68,7 +68,7 @@ const EventRow: React.FC<EventRowProps> = ({ evt }) => {
   );
 };
 
-export const ObservabilityPanel: React.FC = () => {
+export const ObservabilityPanel: React.FC<{ compact?: boolean }> = ({ compact }) => {
   const [events, setEvents] = useState<ObservabilityEvent[]>([]);
   const [connected, setConnected] = useState(false);
   const [expanded, setExpanded] = useState(true);

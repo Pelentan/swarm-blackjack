@@ -40,6 +40,7 @@ services:
       BANK_URL: "http://bank-service:3005"
       CHAT_URL: "http://chat-service:3007"
       EMAIL_URL: "http://email-service:3008"
+      DOCUMENT_URL: "http://document-service:3011"
       UI_URL: "http://ui:3000"
       REDIS_URL: "redis:6379"
     networks:
@@ -135,6 +136,7 @@ services:
       REDIS_URL: "redis://redis:6379"
       JWT_SECRET: "swarm-blackjack-dev-secret-change-in-production"
       EMAIL_URL: "http://email-service:3008"
+      DOCUMENT_URL: "http://document-service:3011"
       BANK_URL: "http://bank-service:3005"
       # Verification links go through gateway so UI topology stays internal
       GATEWAY_URL: "http://localhost:8021"
@@ -174,22 +176,35 @@ services:
   bank-service:
     build: ./bank-service
     container_name: swarm-bank
+    env_file:
+      - bank.env
     environment:
       PORT: "3005"
-      # Bank DB credentials — ONLY bank-service has these
-      DB_URL: "postgresql://bankuser:bankpass@bank-db:5432/bankdb"
-      REDIS_URL: "redis://redis:6379"
+      DOCUMENT_SERVICE_URL: "http://document-service:3011"
     networks:
       - swarm-net
     depends_on:
       - bank-db
-      - redis
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3005/health"]
+      test: ["CMD", "/wget", "-qO-", "http://localhost:3005/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+
+  document-service:
+    build: ./document-service
+    container_name: swarm-document
+    environment:
+      PORT: "3011"
+    networks:
+      - swarm-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3011/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # ── Communication Domain ────────────────────────────────────────────────────
   chat-service:
