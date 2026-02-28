@@ -38,10 +38,10 @@ jobs:
           queries: security-extended
 
       # Java: no Maven/Gradle — explicit javac compile
-      - name: Build Java (bank-service)
-        if: matrix.language == 'java-kotlin'
-        run: |
-          javac bank-service/BankService.java
+      # - name: Build Java (bank-service)
+      #   if: matrix.language == 'java-kotlin'
+      #   run: |
+      #     javac bank-service/BankService.java
 
       # Everything else: autobuild handles it
       - name: Autobuild
